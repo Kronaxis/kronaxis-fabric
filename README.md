@@ -122,17 +122,72 @@ That's it. systemd unit + MCP shim in [`deploy/`](deploy/).
 
 ## vs agentmemory / mem0 / Letta
 
+Fair warning before reading the table: **most of the alternatives are memory-only systems**. Fabric is three things in one binary (coord channel + memory store + orchestrator-coming). Compare on a feature they don't have and the comparison is by definition unfair to them. We've split the table by job-area so you can see what Fabric uniquely covers vs where alternatives match.
+
+### Memory dimension (where the alternatives compete)
+
 | Dimension | **Fabric** | agentmemory | mem0 | Letta/MemGPT |
 |---|---|---|---|---|
-| **Stack** | 1 Go binary + Postgres + Ollama | Node + SQLite + iii-engine | Python + Qdrant/pgvector | Python + Postgres + vector DB |
-| **Lines of code** | ~700 (single file) | thousands across hooks/UI | thousands | tens of thousands (full agent runtime) |
 | **Search** | Hybrid (cosine + tsvector + recency) | BM25 + vector + graph (RRF) | Vector + graph | Vector only |
-| **Multi-agent** | MCP stdio + plain HTTP (any agent) | MCP + REST + leases | API only | Letta runtime only |
-| **External deps** | Postgres + Ollama (both standard) | None (SQLite) | Qdrant/pgvector | Postgres + vector DB |
-| **Ops surface** | Standard Postgres backup/restore | Custom SQLite + iii engine state | Multi-service | Multi-service |
+| **Embeddings** | Local Ollama, free at query time | Local Xenova, free | Cloud-provider call per query | Cloud-provider call per query |
+| **Lines of code** | ~700 (single file) | thousands across hooks/UI | thousands | tens of thousands (full agent runtime) |
+| **Storage** | Postgres + pgvector | SQLite + iii-engine | Qdrant or pgvector | Postgres + vector DB |
 | **MCP wire-up** | `~/.claude.json` 5-line stanza | Same | Manual | Manual |
+| **Auto-capture hooks** | No (explicit `remember` calls) | **Yes (12 lifecycle hooks)** | No | No (agent self-edits) |
+| **Real-time viewer** | No (`psql` is your viewer) | **Yes (port 3113)** | Cloud dash | Cloud dash |
+
+### Coordination + pub/sub (real competitors here are message brokers, not memory tools)
+
+| Dimension | **Fabric** | Redis Streams | NATS JetStream | RabbitMQ | Raw pg_notify |
+|---|---|---|---|---|---|
+| **Adds a new service to run** | No (reuses your Postgres) | **Yes** (Redis) | **Yes** (NATS cluster) | **Yes** (RabbitMQ) | No |
+| **Persistent event log** | Yes (`coord_messages` table) | Yes (XADD stream) | Yes (JetStream) | Yes (with disk queue) | No (fires once, not stored) |
+| **Audit via SQL** | **Yes** (`SELECT * FROM coord_messages WHERE …`) | No (custom CLI) | No (`nats stream`) | No (mgmt UI) | N/A |
+| **Push notifications (sub-second)** | Yes (pg_notify trigger) | Yes (XREAD BLOCK) | Yes | Yes (consumer push) | Yes |
+| **Filter by recipient / since** | Yes (`?recipient=X&since=…`) | Consumer groups | Subjects | Routing keys | DIY |
+| **Bearer-auth same as memory** | **Yes** (one token, one service) | Separate auth | Separate auth | Separate auth | Postgres role |
+| **Best for** | Multi-agent project coord on existing Postgres | High-throughput cache+stream | Microservice fleets | Enterprise messaging | Quick hacks |
+
+For genuine high-throughput broker workloads (millions of msg/s) use NATS or Redis. For multi-agent coord on a project (events per second, not per millisecond), Fabric gives you a sufficient subset on the Postgres you already run.
+
+### Multi-agent orchestration (real competitors are workflow engines + agent frameworks)
+
+| Dimension | **Fabric v0.6** | Temporal | CrewAI | LangGraph | AutoGen | Celery / Prefect |
+|---|---|---|---|---|---|---|
+| **Adds a new service** | No (Postgres) | **Yes** (Temporal cluster + Cassandra/ES) | No (Python library) | No (Python library) | No (Python library) | Yes (broker + workers) |
+| **Cross-language agents** | **Yes** (HTTP from anything) | Yes (SDKs) | Python only | Python only | Python only | Python only |
+| **Task graph storage** | Postgres (`fabric.tasks`) | Internal events DB | In-memory | In-memory | In-memory | Result backend |
+| **Capability-typed dispatch** | **Yes** (`required_capabilities` matched to `session.capabilities`) | Workflow workers | Role-based | State-based | Agent types | Routing keys |
+| **Presence + heartbeat** | **Yes** (90 s auto-offline) | Yes (workers) | No | No | No | Yes (workers) |
+| **Built-in pub/sub** | **Yes** (same coord channel) | Signals | No | No | No | No |
+| **Built-in semantic memory** | **Yes** (same memo store) | No | No (DIY RAG) | Some (state) | No (DIY) | No |
+| **Sweet spot** | Multi-agent coding sessions on one project | Production workflows at scale | LLM agent crews | LLM agent state machines | LLM agent conversations | Background jobs |
+
+If you're orchestrating a 1000-worker production payment pipeline, take Temporal. If you're orchestrating five Claude Code tabs + a CI runner on one project, the Temporal cluster is overkill and you don't already have it running. Fabric is the small-team multi-agent-coding subset of Temporal's job, on the database you already have.
+
+### Code graph + symbol search (v0.5 — real competitors are code-indexing tools)
+
+| Dimension | **Fabric v0.5** | Sourcegraph | codegraph (MCP) | ast-grep | ripgrep + ctags |
+|---|---|---|---|---|---|
+| **Self-host friction** | One binary | Docker compose / SaaS | One binary | One binary | Native |
+| **MCP-native** | **Yes** (same `mcp__fabric__search` namespace) | No (HTTP/GQL) | Yes | No | No |
+| **Symbol embeddings** | **Yes** (cosine on signature + docstring) | Yes (Cody) | No | No | No |
+| **Cross-symbol edges (calls / imports)** | Yes (`symbol_edges`) | Yes | Yes | No | Limited (ctags) |
+| **Same auth as memory + coord** | **Yes** (one Bearer) | Separate | Yes (different MCP) | N/A | N/A |
+| **Languages day-one** | Go + Python | 50+ | Many | Many | All (lexical only) |
+| **Inotify re-index** | v0.5+1 | Yes | Yes | One-shot | One-shot |
+| **Storage** | Postgres (same DB as memos + coord) | Custom Zoekt + Postgres | SQLite | None | tags file |
+
+If you need cross-50-language enterprise code search, Sourcegraph wins. If you want symbol search + relationships in the same Bearer-authed MCP namespace your agents already use for memory and coord, Fabric is the integrated choice.
+
+### Operations
+
+| Dimension | **Fabric** | agentmemory | mem0 | Letta |
+|---|---|---|---|---|
+| **External deps** | Postgres + Ollama (both standard) | None (SQLite) | Qdrant/pgvector | Postgres + vector DB |
+| **Backup story** | `pg_dump` (you already know it) | Custom SQLite + iii state | Multi-service | Multi-service |
+| **Ops surface** | Standard Postgres | Custom SQLite + iii engine | Multi-service | Multi-service |
 | **Self-host friction** | One binary + `systemd --user` | One binary + node runtime | Docker compose | Docker compose |
-| **Cross-session event bus** | Yes (coord + pg_notify) | No | No | No |
 | **Cost / scale story** | pgvector scales to millions; Postgres ops you already do | SQLite hits write-lock at scale | Qdrant means another service | Vector DB means another service |
 
 **When Fabric wins**:
