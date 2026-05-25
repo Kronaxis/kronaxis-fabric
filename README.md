@@ -41,7 +41,7 @@ your agent ─POST /v1/chat/completions─▶ Kronaxis Router ─▶ chooses che
 **Real measurement on a real project (this one)**: 715 → 172 line `CLAUDE.md` + 1050 → 51 line `MEMORY.md` after the fabric cutover. **~92 K tokens saved per session preload.** At Anthropic Opus rates that's ~£0.45 per session, ~£14/day for a 30-session day. Compounds fast.
 
 **Better than grepping your own notes**:
-- **Semantic search** — query "cellsocks IWLAN egress block" finds memos that say "Pixel 4 carrier-side data context blocked" without sharing a single word
+- **Semantic search** — query "database connection pool exhaustion fix" finds memos that say "postgres max_connections raised after 503 burst" without sharing a single word
 - **Hybrid rank** — cosine (50%) + tsvector (30%) + recency (20%) so a fresh half-baked memo doesn't outrank a verified 3-week-old reference
 - **Score-comparable across queries** — 0–1 cosine-based, not a per-query magic number
 
