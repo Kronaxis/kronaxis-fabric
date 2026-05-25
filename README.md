@@ -211,4 +211,4 @@ Built + deployed on a single project (this one) on 2026-05-25:
 
 [BSL-1.1](LICENSE). Source-available; internal + non-commercial use granted. Production / commercial use requires a separate licence — contact `contact@kronaxis.co.uk`.
 
-Same licence model as [Kronaxis Behavioural OS](https://github.com/kronaxis/kronaxis-behavioural-os) and [Kronaxis Router](https://github.com/kronaxis/kronaxis-router).
+Same licence model as [Kronaxis Router](https://github.com/kronaxis/kronaxis-router).
