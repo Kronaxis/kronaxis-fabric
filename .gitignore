@@ -1,0 +1,20 @@
+# Binary outputs
+/fabric
+/cmd/fabric/fabric
+/bin/
+/dist/
+
+# Logs
+*.log
+fabric.log
+
+# Backups + scratch
+*.bak
+*.bak-*
+*.tmp
+*.swp
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
