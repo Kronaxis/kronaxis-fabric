@@ -234,6 +234,25 @@ Same answer quality on the typical "how does X work" query, because the model re
 | POST | `/v1/memo/backfill` | Bearer | Embed any memos with NULL embedding |
 | POST | `/v1/coord` | Bearer | `{sender, recipient, subject, body}` → coord_messages + pg_notify |
 | GET | `/v1/coord/recent` | Bearer | `?limit=&since=&recipient=` |
+| POST | `/v1/symbol` | Bearer | **v0.5** — upsert code symbol (indexer-side) |
+| POST | `/v1/symbol/edge` | Bearer | **v0.5** — upsert symbol→symbol edge (`calls`/`imports`/`references`) |
+| POST | `/v1/symbol/search` | Bearer | **v0.5** — hybrid search over symbols (same shape as memo search) |
+| GET | `/v1/symbol/:id/callers` | Bearer | **v0.5** — incoming edges |
+| GET | `/v1/symbol/:id/callees` | Bearer | **v0.5** — outgoing edges |
+| POST | `/v1/symbol/reindex` | Bearer | **v0.5** — one-shot reindex hook (calls `scripts/kx-fabric-indexer.py`) |
+| POST | `/v1/session` | Bearer | **v0.6** — register/refresh `{id, host, capabilities}`, idempotent |
+| POST | `/v1/session/:id/heartbeat` | Bearer | **v0.6** — 30 s heartbeat; 90 s offline reaper |
+| GET | `/v1/sessions` | Bearer | **v0.6** — `?status=&capability=` filters |
+| POST | `/v1/task` | Bearer | **v0.6** — create `{title, brief, required_capabilities, created_by}` |
+| POST | `/v1/task/claim` | Bearer | **v0.6** — body `{session_id}`, atomic capability-matched claim |
+| POST | `/v1/task/:id/complete` | Bearer | **v0.6** — body `{result, status?}` |
+| GET | `/v1/tasks` | Bearer | **v0.6** — `?status=&assigned=&since=` |
+| GET | `/v1/federation/coord/since/:id` | Bearer | **v0.7** — pull coord_messages above high-water |
+| POST | `/v1/federation/coord/import` | Bearer | **v0.7** — bulk import from peer |
+| POST | `/v1/federation/peer` | Bearer | **v0.7** — register `{id, url, bearer_token}` peer |
+| GET | `/v1/federation/peers` | Bearer | **v0.7** — list peers + last-pull state |
+| POST | `/v1/router/observation` | Bearer | **v0.8** — record `{request_hash, task_category, model_id, cost_usd, latency_ms, outcome}` |
+| GET | `/v1/router/recommend` | Bearer | **v0.8** — `?category=X` → ranked model list over 30-day window |
 
 Search `mode`: `hybrid` (default), `semantic`, `tsvector`.
 
@@ -277,34 +296,65 @@ Built + deployed on a single project (this one) on 2026-05-25:
 - Latency 89-181 ms p50 LAN. Cold-start embed ~3 s once, then warm.
 - A/B vs agentmemory on identical queries: tied on quality, 2-3× faster on latency.
 - Drove a 76% reduction in `CLAUDE.md` size (715 → 172 lines) by extracting pitfall sections to fabric memos. Sessions still find the content via search.
+- v0.5 → v0.8 shipped same day: schema + endpoints + smoke tests for code graph, orchestrator, federation, router learning. End-to-end smoked: session-register → task-create → capability-matched claim → router-observation → router-recommend all green.
 
 ## Status
 
-**v0.2.0.** Single shared Bearer token, no multi-tenancy, no RBAC. Production-ready for single-operator / small-team use; the items in [Roadmap](#roadmap) gate broader deployment.
+**v0.8.0.** Memos + coord + code graph + orchestrator + federation primitives + router learning loop — all in one binary, one Postgres database, one Bearer token. Single shared key, no multi-tenancy, no RBAC. Production-ready for single-operator / small-team use; v1.0 items below gate broader deployment.
 
-## What v0.2.0 ships
+## What v0.8.0 ships
 
-- **Bearer-token auth** (single shared `FABRIC_KEY`) on every endpoint except `/v1/health`
-- **Memo CRUD** with sha256 dedup via `ON CONFLICT`
-- **Hybrid search** — cosine 50% + tsvector 30% + recency 20% (configurable mode)
-- **Embeddings** via Ollama `nomic-embed-text`, 768d, pgvector ivfflat index. Best-effort on write; falls back to NULL on Ollama failure (search still works via tsvector fallback)
-- **Backfill endpoint** for any memos with NULL embedding (post-Ollama-fix or post-import)
-- **Coord channel** — `public.coord_messages` + pg_notify pub/sub for cross-session events
-- **Soft delete** — `deleted_at` filtered from all reads
+**Memory substrate (v0.2)**
+- Memo CRUD with sha256 dedup via `ON CONFLICT`
+- Hybrid search — cosine 50% + tsvector 30% + recency 20% (configurable mode)
+- Embeddings via Ollama `nomic-embed-text`, 768d, pgvector ivfflat index
+- Backfill endpoint for memos with NULL embedding
+- Soft delete (`deleted_at` filtered from all reads)
+
+**Coord channel (v0.2)**
+- `public.coord_messages` + pg_notify pub/sub for cross-session events
+- Filter recent events by sender / recipient / since
+- `origin_host` carried through since v0.7
+
+**Code graph (v0.5)**
+- `fabric.symbols` + `fabric.symbol_edges` schema (functions / methods / types + `calls`/`imports`/`references` edges)
+- Hybrid name + semantic search over symbols (same shape as memo search)
+- Callers / callees lookups (`GET /v1/symbol/:id/callers`)
+- Indexer at `scripts/kx-fabric-indexer.py` (tree-sitter, Go + Python tier 1, one-shot mode)
+
+**Orchestrator (v0.6)**
+- `fabric.sessions` + `fabric.tasks` schema with capability arrays
+- Atomic capability-matched task claim (`UPDATE … RETURNING …`)
+- 30 s heartbeat / 90 s offline reaper / 5 min stale-task auto-revert
+- Formalises the MAIN-orchestrator + worker-sessions pattern that today is hand-coordinated
+
+**Federation primitives (v0.7)**
+- `origin_host` on coord + tasks, `fabric.federation_peers` registry
+- Pull-based replication endpoint (peer A polls peer B's `/v1/federation/coord/since/:high_water`)
+- 5 s background poll loop per registered peer
+- Logical replication slots remain operator-side ops; fabric provides the data plane
+
+**Router learning loop (v0.8)**
+- `fabric.router_observations` schema captures `{request_hash, task_category, model_id, cost_usd, latency_ms, outcome, outcome_score?}`
+- `GET /v1/router/recommend?category=X` returns ranked model list over 30-day window, sorted by `success_rate / cost_usd_avg`
+- The cheapest-competent-model decision now gets data-driven over time
+
+**Shared infrastructure**
+- Bearer-token auth (single shared `FABRIC_KEY`) on every endpoint except `/v1/health`
+- Schema migrations idempotent on boot (`CREATE/ALTER … IF NOT EXISTS`)
+- 3 smoke-test bash scripts per version in `scripts/test/v0.X-smokes.sh`
 
 ## Roadmap
 
-What v0.2.0 ships is the **memory + coord substrate**. The bigger vision builds on top of it:
+v0.5 → v0.8 shipped 2026-05-25 in one binary. Remaining:
 
-- **v0.3** — Per-tenant Bearer keys, RBAC scopes, audit log table
-- **v0.4** — Native MCP stdio (no Python shim), WebSocket subscriptions on coord, typed session capabilities (each agent registers what it can do; coord broadcasts can target by capability instead of name)
-- **v0.5** — Code graph integration (tree-sitter, inotify-driven re-index) so search returns code symbols + relationships, not just memos. Replaces the graphify-style snapshot workflow.
-- **v0.6** — Orchestrator layer: task graph in Postgres + presence/heartbeat per session + automatic dispatch by capability match. Formalises the MAIN-orchestrator + worker-sessions pattern that today is hand-coordinated via coord broadcasts.
-- **v0.7** — Multi-host federation via `pg_notify` + replication slots so coord events fan out across 3+ Postgres replicas without a broker dependency.
-- **v0.8** — Router learning loop: record `{request, model, outcome, cost, latency}` per Router call into Fabric. Use that history to train routing weights so the cheapest-competent-model decision gets sharper over time.
-- **v1.0** — Multi-tenancy, SSO, signed release artifacts.
+- **v0.3** *(parked)* — Per-tenant Bearer keys, RBAC scopes, audit log table
+- **v0.4** *(parked)* — Native MCP stdio (no Python shim), WebSocket subscriptions on coord
+- **v0.9** — inotify-driven incremental code reindex; quality grader integration that auto-fills `router_observations.outcome_score`
+- **v0.10** — logical-replication-slot federation (today's polling becomes the v0.9 fallback path)
+- **v1.0** — Multi-tenancy, SSO, signed release artifacts, formal MCP surface
 
-The end state: one Postgres-backed nervous system that replaces ad-hoc memory, ad-hoc inter-session coord, ad-hoc orchestrator-worker dispatch, and ad-hoc router heuristics with one auditable store. v0.2.0 ships the foundations; the rest builds on the same schema + endpoints.
+The end state: one Postgres-backed nervous system that replaces ad-hoc memory, ad-hoc inter-session coord, ad-hoc orchestrator-worker dispatch, ad-hoc code-graph snapshots, and ad-hoc router heuristics with one auditable store. v0.8.0 lands all five substrate pieces; v0.9+ tightens them.
 
 ## Licence
 
