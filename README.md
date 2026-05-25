@@ -5,7 +5,17 @@
 <h1 align="center">Kronaxis Fabric</h1>
 
 <p align="center">
-  <strong>The memory layer your routed LLM stack is missing. One Go binary. Postgres + pgvector hybrid search. Sub-100&nbsp;ms recall over thousands of memos. The right context to send, decided in milliseconds, before <a href="https://github.com/kronaxis/kronaxis-router">Kronaxis Router</a> picks which model to send it to.</strong>
+  <strong>The nervous system for multi-agent LLM workflows. One Go binary on one Postgres database, doing three things every multi-agent stack reinvents badly:</strong>
+</p>
+
+<p align="center">
+  <strong>1. Cross-session coordination</strong> &middot;
+  <strong>2. Shared semantic memory</strong> &middot;
+  <strong>3. Capability-typed orchestration (v0.6)</strong>
+</p>
+
+<p align="center">
+  Stop running three services (agentmemory + a broker + your own task queue) when one Postgres schema does the lot. Plays directly into <a href="https://github.com/kronaxis/kronaxis-router">Kronaxis Router</a> for the cheapest-competent-model decision.
 </p>
 
 <p align="center">
@@ -19,24 +29,35 @@
 ---
 
 ```
-your agent ─POST /v1/memo/search─▶ Kronaxis Fabric ─▶ Postgres + pgvector + tsvector
-   (Claude Code,                       │             ─▶ Ollama nomic-embed-text (768d)
-    Codex, Aider,                      │             ─▶ recency rerank (30-day half-life)
-    your own runtime)                  │
-                                       ├─ hybrid rank in <100 ms p50 (LAN)
-                                       ├─ sha256 dedup, soft delete, ON CONFLICT upsert
-                                       ├─ MCP stdio shim (drops into ~/.claude.json natively)
-                                       └─ pg_notify coord channel for cross-session events
+                          ┌─ POST /v1/coord    ──▶ broadcast to other sessions (pg_notify)
+   Tab A (orchestrator) ──┤                       
+                          ├─ POST /v1/memo     ──▶ bank a finding (semantic + tsvector + recency)
+                          └─ POST /v1/task     ──▶ create work item, required_capabilities=[...]
+                                                       │
+                                                       │  (Fabric routes by capability)
+                                                       ▼
+                                  ┌──── POST /v1/task/claim ──── Tab B (capabilities=["go-build"])
+   Kronaxis Fabric ─────────────► ├──── POST /v1/task/claim ──── Tab C (capabilities=["python","gpu-3090"])
+   (one Go binary,                └──── POST /v1/task/claim ──── CI runner (capabilities=["docker","aws"])
+    one Postgres schema)
+                                  │
+                                  ├──── GET /v1/coord/recent ─── any session polls broadcasts
+                                  ├──── POST /v1/memo/search ─── 90ms hybrid search over 1000s of memos
+                                  └──── POST /v1/router/obs ──── learning loop for Kronaxis Router
 
-your agent ─POST /v1/chat/completions─▶ Kronaxis Router ─▶ chooses cheapest competent model
-                                                              (sovereign 7-9B / frontier / CLI agent)
+   Tab D (your agent) ──POST /v1/chat/completions──▶ Kronaxis Router ──▶ cheapest competent model
+                                                            (uses fabric memo search to keep context tiny)
 ```
 
-**Router decides WHICH model. Fabric decides WHAT context to send.** Pair them and you stop paying frontier prices for context you didn't need to send to a model that didn't need to be that big.
+**Three jobs, one substrate.** Coord channel for "what is everyone else doing right now". Memory for "what did I learn last week". Task graph + capability dispatch for "who in this fleet is best placed to do X". All on the same Postgres, same Bearer token, same single Go binary.
+
+**Pairs with Kronaxis Router**: Router decides WHICH model. Fabric decides WHAT context. Together you stop paying frontier prices for context you didn't need to send to a model that didn't need to be that big.
 
 ## Why use it
 
-**Stop preloading 100 KB of project notes into every session.** Every Claude Code / Codex / Aider session starts by loading `CLAUDE.md` + `MEMORY.md` + curated notes. That's 60–90 K tokens *per turn*, every turn, in every session. Fabric replaces it with on-demand hybrid search: only the 3 memos relevant to *this* turn get loaded, ranked semantically + lexically + by recency.
+**Reason 1 — Multi-agent stacks reinvent coordination badly.** Five Claude Code tabs on the same project. An overnight cron. A CI runner. Each one needs to (a) see what the others are doing, (b) avoid duplicating work, (c) hand off findings, (d) recover when a tab crashes. The default answer today is some combination of Slack channel humans monitor, ad-hoc REST endpoints, and "remember to message me when you're done". Fabric ships a coord channel + task graph + capability dispatch on one Postgres schema. The orchestrator pattern we used to build Fabric *itself* (one MAIN tab coordinating four worker tabs across two hosts) was hand-coordinated via Fabric's coord broadcasts. v0.6 formalises it with typed sessions + presence + automatic dispatch.
+
+**Reason 2 — Stop preloading 100 KB of project notes into every session.** Every Claude Code / Codex / Aider session starts by loading `CLAUDE.md` + `MEMORY.md` + curated notes. That's 60–90 K tokens *per turn*, every turn, in every session. Fabric replaces it with on-demand hybrid search: only the 3 memos relevant to *this* turn get loaded, ranked semantically + lexically + by recency.
 
 **Real measurement on a real project (this one)**: 715 → 172 line `CLAUDE.md` + 1050 → 51 line `MEMORY.md` after the fabric cutover. **~92 K tokens saved per session preload.** At Anthropic Opus rates that's ~£0.45 per session, ~£14/day for a 30-session day. Compounds fast.
 
