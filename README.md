@@ -51,6 +51,23 @@ your agent ─POST /v1/chat/completions─▶ Kronaxis Router ─▶ chooses che
 - Postgres-backed = your DBA already knows how to back it up
 - Embeddings via local Ollama = zero per-query cost, zero data leaving your box
 
+## Cross-session coordination (the underrated half)
+
+Memos solve "what did I learn last week". The other half of multi-agent workflows is "what is the agent in the other tab doing right now". Fabric ships a coord channel on the same Postgres: `POST /v1/coord` writes a row to `public.coord_messages` and fires `pg_notify('coord', ...)`; `GET /v1/coord/recent` lets any session poll the last N events filtered by sender / recipient / since.
+
+```bash
+# Tab A broadcasts a finding
+curl -X POST -H "Authorization: Bearer $FABRIC_KEY" -H "Content-Type: application/json" \
+  -d '{"sender":"A","recipient":"all","subject":"db migration done","body":"schema v17 applied"}' \
+  http://fabric:8201/v1/coord
+
+# Tab B (or a CI runner, or your laptop) reads the recent broadcasts
+curl -H "Authorization: Bearer $FABRIC_KEY" \
+  "http://fabric:8201/v1/coord/recent?limit=10&recipient=all"
+```
+
+We used this in tonight's session to coordinate five concurrent agent tabs (orchestrator + workers) on the same project. It is the unsung infrastructure piece — agentmemory / mem0 / Letta don't have a cross-session event bus, only memory. **Multi-agent workflows on a single project need both**, and Fabric ships both behind the same Bearer token on the same Postgres.
+
 ## Quickstart (60 seconds)
 
 ```bash
@@ -94,6 +111,7 @@ That's it. systemd unit + MCP shim in [`deploy/`](deploy/).
 | **Ops surface** | Standard Postgres backup/restore | Custom SQLite + iii engine state | Multi-service | Multi-service |
 | **MCP wire-up** | `~/.claude.json` 5-line stanza | Same | Manual | Manual |
 | **Self-host friction** | One binary + `systemd --user` | One binary + node runtime | Docker compose | Docker compose |
+| **Cross-session event bus** | Yes (coord + pg_notify) | No | No | No |
 | **Cost / scale story** | pgvector scales to millions; Postgres ops you already do | SQLite hits write-lock at scale | Qdrant means another service | Vector DB means another service |
 
 **When Fabric wins**:
@@ -200,12 +218,17 @@ Built + deployed on a single project (this one) on 2026-05-25:
 
 ## Roadmap
 
+What v0.2.0 ships is the **memory + coord substrate**. The bigger vision builds on top of it:
+
 - **v0.3** — Per-tenant Bearer keys, RBAC scopes, audit log table
-- **v0.4** — Native MCP stdio (no Python shim), WebSocket subscriptions on coord
-- **v0.5** — Code graph integration (tree-sitter), inotify-driven indexing
-- **v0.6** — Multi-host federation via pg_notify + replication slots
-- **v0.7** — Router learning loop (record outcomes, train routing weights)
-- **v1.0** — Multi-tenancy, SSO, signed release artifacts
+- **v0.4** — Native MCP stdio (no Python shim), WebSocket subscriptions on coord, typed session capabilities (each agent registers what it can do; coord broadcasts can target by capability instead of name)
+- **v0.5** — Code graph integration (tree-sitter, inotify-driven re-index) so search returns code symbols + relationships, not just memos. Replaces the graphify-style snapshot workflow.
+- **v0.6** — Orchestrator layer: task graph in Postgres + presence/heartbeat per session + automatic dispatch by capability match. Formalises the MAIN-orchestrator + worker-sessions pattern that today is hand-coordinated via coord broadcasts.
+- **v0.7** — Multi-host federation via `pg_notify` + replication slots so coord events fan out across 3+ Postgres replicas without a broker dependency.
+- **v0.8** — Router learning loop: record `{request, model, outcome, cost, latency}` per Router call into Fabric. Use that history to train routing weights so the cheapest-competent-model decision gets sharper over time.
+- **v1.0** — Multi-tenancy, SSO, signed release artifacts.
+
+The end state: one Postgres-backed nervous system that replaces ad-hoc memory, ad-hoc inter-session coord, ad-hoc orchestrator-worker dispatch, and ad-hoc router heuristics with one auditable store. v0.2.0 ships the foundations; the rest builds on the same schema + endpoints.
 
 ## Licence
 
