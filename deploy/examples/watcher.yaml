@@ -1,0 +1,22 @@
+fabric_url: http://localhost:8201
+fabric_key: ${FABRIC_KEY}
+indexer_path: /home/jason/projects/kronaxis-fabric/scripts/kx-fabric-indexer.py
+repos:
+  - repo: kronaxis-fabric
+    path: /home/jason/projects/kronaxis-fabric
+    languages: [go, python]
+  - repo: kronaxis-router
+    path: /home/jason/projects/kronaxis/kronaxis-router
+    languages: [go]
+  - repo: leaddistro
+    path: /home/jason/projects/kronaxis/leaddistro
+    languages: [go, python, ts]
+debounce_ms: 500
+ignore:
+  - .git/
+  - node_modules/
+  - vendor/
+  - target/
+  - dist/
+  - "*.pyc"
+  - "__pycache__/"

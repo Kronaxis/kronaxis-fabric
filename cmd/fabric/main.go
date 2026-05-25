@@ -21,7 +21,7 @@ import (
 	pgvector "github.com/pgvector/pgvector-go"
 )
 
-const version = "0.8.0"
+const version = "0.9.0"
 
 const embeddingDim = 768
 const embeddingModel = "nomic-embed-text"
@@ -1560,6 +1560,17 @@ func (s *server) handleRouterObservation(w http.ResponseWriter, r *http.Request)
 	if req.Outcome == "" {
 		req.Outcome = "unknown"
 	}
+
+	// v0.9 D4: if caller did not supply outcome_score, grade it automatically
+	// so /v1/router/recommend ranks more sharply on partial telemetry.
+	var graded *float64
+	if req.OutcomeScore == nil {
+		score := gradeOutcome(req)
+		graded = &score
+	} else {
+		graded = req.OutcomeScore
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	var id int64
@@ -1567,13 +1578,42 @@ func (s *server) handleRouterObservation(w http.ResponseWriter, r *http.Request)
 		INSERT INTO fabric.router_observations (request_hash, task_category, model_id, cost_usd, latency_ms, outcome, outcome_score)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)
 		RETURNING id`,
-		req.RequestHash, req.TaskCategory, req.ModelID, req.CostUSD, req.LatencyMs, req.Outcome, req.OutcomeScore,
+		req.RequestHash, req.TaskCategory, req.ModelID, req.CostUSD, req.LatencyMs, req.Outcome, graded,
 	).Scan(&id)
 	if err != nil {
 		writeErr(w, 500, "db: "+err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"id": id, "recorded": true})
+	writeJSON(w, 200, map[string]any{"id": id, "recorded": true, "outcome_score": graded, "graded": req.OutcomeScore == nil})
+}
+
+// gradeOutcome assigns a 0..1 quality score from coarse signals on the
+// router observation. Conservative — explicit caller scores always override.
+func gradeOutcome(req routerObservationReq) float64 {
+	outcome := strings.ToLower(strings.TrimSpace(req.Outcome))
+	switch outcome {
+	case "failed", "error", "timeout":
+		return 0.0
+	case "partial":
+		return 0.4
+	}
+	score := 0.9
+	if outcome == "unknown" {
+		score = 0.6
+	}
+	if req.LatencyMs > 60_000 {
+		score -= 0.2
+	}
+	if req.CostUSD < 0 {
+		score -= 0.3
+	}
+	if score < 0 {
+		score = 0
+	}
+	if score > 1 {
+		score = 1
+	}
+	return score
 }
 
 func (s *server) handleRouterRecommend(w http.ResponseWriter, r *http.Request) {

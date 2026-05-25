@@ -1,0 +1,14 @@
+[Unit]
+Description=Kronaxis Fabric watcher (inotify → /v1/symbol/reindex)
+After=network.target fabric.service
+
+[Service]
+Type=simple
+Environment=FABRIC_URL=http://localhost:8201
+Environment=FABRIC_KEY=test-key-1
+ExecStart=/usr/local/bin/fabric-watcher --config %h/.fabric/watcher.yaml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

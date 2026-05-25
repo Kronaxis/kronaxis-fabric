@@ -263,6 +263,7 @@ def main() -> int:
     ap.add_argument("--fabric-url", default=os.environ.get("FABRIC_URL", "http://localhost:8201"))
     ap.add_argument("--key", default=os.environ.get("FABRIC_KEY", ""))
     ap.add_argument("--no-edges", action="store_true", help="skip edge upload (symbols only)")
+    ap.add_argument("--file", default="", help="index only this file (path relative to --root); used by fabric-watcher")
     args = ap.parse_args()
 
     if not args.key:
@@ -278,10 +279,24 @@ def main() -> int:
     session = requests.Session()
     session.headers.update(headers)
 
+    # Decide what to walk: either a single file (watcher mode) or the whole tree.
+    if args.file:
+        target = (root / args.file).resolve()
+        if not target.is_file():
+            sys.stderr.write(f"--file not found: {target}\n")
+            return 2
+        ext = target.suffix.lower()
+        if ext not in EXTENSIONS:
+            sys.stderr.write(f"--file extension {ext} not indexed; skipping\n")
+            return 0
+        targets = [(target, ext)]
+    else:
+        targets = list(walk_repo(root))
+
     all_symbols: list[Symbol] = []
     all_edges: list[Edge] = []
     files_seen = 0
-    for path, ext in walk_repo(root):
+    for path, ext in targets:
         rel = str(path.relative_to(root))
         try:
             source = path.read_bytes()
