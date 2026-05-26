@@ -21,7 +21,7 @@ import (
 	pgvector "github.com/pgvector/pgvector-go"
 )
 
-const version = "0.9.0"
+const version = "0.10.0"
 
 const embeddingDim = 768
 const embeddingModel = "nomic-embed-text"
@@ -148,6 +148,29 @@ CREATE TABLE IF NOT EXISTS fabric.router_observations (
 
 CREATE INDEX IF NOT EXISTS router_obs_category_model_idx
   ON fabric.router_observations (task_category, model_id, observed_at DESC);
+
+-- ---------- v0.10 RAG chunks (Router <-> Fabric integration) ----------
+-- Code/doc chunks for prompt augmentation. Smaller than memos, content-
+-- addressed by sha256, scored against inbound queries via the /v1/rag
+-- endpoint. Populated by the chunk-ingestion workstream (Router's
+-- chunk-builder writes here instead of its local pgvector table).
+CREATE TABLE IF NOT EXISTS fabric.chunks (
+  id BIGSERIAL PRIMARY KEY,
+  source_path TEXT NOT NULL,
+  source_range TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+  embedding vector(768),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT chunks_sha256_uniq UNIQUE (content_sha256)
+);
+
+CREATE INDEX IF NOT EXISTS chunks_tsv_idx ON fabric.chunks USING gin (tsv);
+CREATE INDEX IF NOT EXISTS chunks_source_idx ON fabric.chunks (source_path);
+CREATE INDEX IF NOT EXISTS chunks_created_idx ON fabric.chunks (created_at DESC);
+CREATE INDEX IF NOT EXISTS chunks_emb_ivf ON fabric.chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 `
 
 type server struct {
@@ -1971,6 +1994,22 @@ func (s *server) routes() http.Handler {
 		s.handleRouterObservation(w, r)
 	})
 	mux.HandleFunc("/v1/router/recommend", s.handleRouterRecommend)
+
+	// ---------- v0.10 RAG (Router <-> Fabric integration) ----------
+	mux.HandleFunc("/v1/rag", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			writeErr(w, 405, "POST only")
+			return
+		}
+		s.handleRAG(w, r)
+	})
+	mux.HandleFunc("/v1/chunks", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			writeErr(w, 405, "POST only")
+			return
+		}
+		s.handleChunkUpsert(w, r)
+	})
 
 	return mux
 }
