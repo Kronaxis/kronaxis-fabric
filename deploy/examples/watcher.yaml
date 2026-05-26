@@ -1,6 +1,10 @@
 fabric_url: http://localhost:8201
 fabric_key: ${FABRIC_KEY}
 indexer_path: /home/jason/projects/kronaxis-fabric/scripts/kx-fabric-indexer.py
+metrics_addr: 127.0.0.1:8202  # GET /healthz
+debounce_ms: 500
+backoff_max_ms: 60000          # cap exponential backoff at 60s
+startup_rescan: true           # walk every repo once on boot to reconcile drift
 repos:
   - repo: kronaxis-fabric
     path: /home/jason/projects/kronaxis-fabric
@@ -11,7 +15,6 @@ repos:
   - repo: leaddistro
     path: /home/jason/projects/kronaxis/leaddistro
     languages: [go, python, ts]
-debounce_ms: 500
 ignore:
   - .git/
   - node_modules/

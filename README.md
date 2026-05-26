@@ -350,7 +350,7 @@ v0.5 → v0.8 shipped 2026-05-25 in one binary. Remaining:
 
 - **v0.3** *(parked)* — Per-tenant Bearer keys, RBAC scopes, audit log table
 - **v0.4** *(parked)* — Native MCP stdio (no Python shim), WebSocket subscriptions on coord
-- **v0.9** — inotify-driven incremental code reindex; quality grader integration that auto-fills `router_observations.outcome_score`
+- **v0.9** — inotify-driven incremental code reindex (`cmd/fabric-watcher/`, `feature/v0.9-inotify-watcher`); quality grader integration that auto-fills `router_observations.outcome_score`
 - **v0.10** — logical-replication-slot federation (today's polling becomes the v0.9 fallback path)
 - **v1.0** — Multi-tenancy, SSO, signed release artifacts, formal MCP surface
 
