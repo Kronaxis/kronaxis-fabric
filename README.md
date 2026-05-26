@@ -5,6 +5,14 @@
 <h1 align="center">Kronaxis Fabric</h1>
 
 <p align="center">
+  <a href="#roadmap"><img src="https://img.shields.io/badge/status-v0.10%20alpha-orange?style=flat-square" alt="v0.10 alpha"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL%201.1-blue?style=flat-square" alt="BSL 1.1"></a>
+  <a href="https://kronaxis.co.uk/kronaxis-fabric"><img src="https://img.shields.io/badge/docs-kronaxis.co.uk-black?style=flat-square" alt="docs"></a>
+</p>
+
+> **⚠️ v0.10 alpha.** Production-ready for single-operator / small-team use. Breaking changes are likely until v1.0 lands multi-tenancy + SSO + signed release artifacts. Schema migrations are forward-only — back up your Postgres before upgrading minor versions. See the [Roadmap](#roadmap) for what's gated on v1.0.
+
+<p align="center">
   <strong>The nervous system for multi-agent LLM workflows. One Go binary on one Postgres database, doing three things every multi-agent stack reinvents badly:</strong>
 </p>
 
