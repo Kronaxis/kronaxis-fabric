@@ -187,6 +187,13 @@ type memoCreateReq struct {
 	Content string   `json:"content"`
 	Type    string   `json:"type"`
 	Tags    []string `json:"tags"`
+	// UpsertKey enables supersession semantics. If non-empty, the request
+	// performs an UPSERT against the unique partial index on upsert_key
+	// instead of the default sha256 dedup. Banking "CURRENT STATE 2026-06-06"
+	// with upsert_key="voice_subsystem_state" overwrites the prior memo at
+	// that key in-place (same id, fresh title/content/type/embedding/ts).
+	// Search returns at most one row per key — the freshest one.
+	UpsertKey string `json:"upsert_key,omitempty"`
 }
 
 type memoUpdateReq struct {
@@ -197,10 +204,11 @@ type memoUpdateReq struct {
 }
 
 type memoCreateResp struct {
-	ID       int64  `json:"id"`
-	SHA256   string `json:"sha256"`
-	Deduped  bool   `json:"deduped"`
-	Embedded bool   `json:"embedded"`
+	ID         int64  `json:"id"`
+	SHA256     string `json:"sha256"`
+	Deduped    bool   `json:"deduped"`
+	Embedded   bool   `json:"embedded"`
+	Superseded bool   `json:"superseded,omitempty"` // true when upsert_key path updated a prior row
 }
 
 type searchReq struct {
@@ -365,11 +373,11 @@ type routerObservationReq struct {
 }
 
 type routerRecommendation struct {
-	ModelID      string  `json:"model_id"`
-	CostUSDAvg   float64 `json:"cost_usd_avg"`
-	LatencyP50   float64 `json:"latency_p50"`
-	SuccessRate  float64 `json:"success_rate"`
-	SampleSize   int     `json:"sample_size"`
+	ModelID     string  `json:"model_id"`
+	CostUSDAvg  float64 `json:"cost_usd_avg"`
+	LatencyP50  float64 `json:"latency_p50"`
+	SuccessRate float64 `json:"success_rate"`
+	SampleSize  int     `json:"sample_size"`
 }
 
 // ---------- Ollama embedding ----------
@@ -450,11 +458,11 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		dbStatus = "err: " + err.Error()[:80]
 	}
 	writeJSON(w, 200, map[string]any{
-		"ok":             dbStatus == "ok",
-		"version":        version,
-		"db":             dbStatus,
+		"ok":              dbStatus == "ok",
+		"version":         version,
+		"db":              dbStatus,
 		"embedding_model": embeddingModel,
-		"embedding_dim":  embeddingDim,
+		"embedding_dim":   embeddingDim,
 	})
 }
 
@@ -492,7 +500,57 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var id int64
 	var deduped bool
 	var inserted bool
-	if emb != nil {
+	var superseded bool
+
+	// Supersession path: ON CONFLICT (upsert_key) DO UPDATE the prior row
+	// in-place with the new title/content/type/tags/embedding/updated_at.
+	// SHA256 dedup is bypassed because the whole point is that the content
+	// has CHANGED (e.g. CURRENT STATE 2026-06-06 vs the May version).
+	if req.UpsertKey != "" {
+		if emb != nil {
+			err := s.pool.QueryRow(ctx, `
+				INSERT INTO fabric.memos (title, content, type, tags, sha256, embedding, upsert_key)
+				VALUES ($1, $2, $3, $4, $5, $6, $7)
+				ON CONFLICT (upsert_key)
+				  WHERE upsert_key IS NOT NULL AND deleted_at IS NULL
+				DO UPDATE SET
+					title = EXCLUDED.title,
+					content = EXCLUDED.content,
+					type = EXCLUDED.type,
+					tags = EXCLUDED.tags,
+					sha256 = EXCLUDED.sha256,
+					embedding = EXCLUDED.embedding,
+					updated_at = now()
+				RETURNING id, (xmax = 0)`,
+				req.Title, req.Content, req.Type, append([]string{}, req.Tags...), hash, pgvector.NewVector(emb), req.UpsertKey,
+			).Scan(&id, &inserted)
+			if err != nil {
+				writeErr(w, 500, "db: "+err.Error())
+				return
+			}
+		} else {
+			err := s.pool.QueryRow(ctx, `
+				INSERT INTO fabric.memos (title, content, type, tags, sha256, upsert_key)
+				VALUES ($1, $2, $3, $4, $5, $6)
+				ON CONFLICT (upsert_key)
+				  WHERE upsert_key IS NOT NULL AND deleted_at IS NULL
+				DO UPDATE SET
+					title = EXCLUDED.title,
+					content = EXCLUDED.content,
+					type = EXCLUDED.type,
+					tags = EXCLUDED.tags,
+					sha256 = EXCLUDED.sha256,
+					updated_at = now()
+				RETURNING id, (xmax = 0)`,
+				req.Title, req.Content, req.Type, append([]string{}, req.Tags...), hash, req.UpsertKey,
+			).Scan(&id, &inserted)
+			if err != nil {
+				writeErr(w, 500, "db: "+err.Error())
+				return
+			}
+		}
+		superseded = !inserted
+	} else if emb != nil {
 		err := s.pool.QueryRow(ctx, `
 			INSERT INTO fabric.memos (title, content, type, tags, sha256, embedding)
 			VALUES ($1, $2, $3, $4, $5, $6)
@@ -517,8 +575,8 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	deduped = !inserted
-	writeJSON(w, 200, memoCreateResp{ID: id, SHA256: hash, Deduped: deduped, Embedded: emb != nil})
+	deduped = !inserted && !superseded
+	writeJSON(w, 200, memoCreateResp{ID: id, SHA256: hash, Deduped: deduped, Embedded: emb != nil, Superseded: superseded})
 }
 
 func (s *server) handleUpdate(w http.ResponseWriter, r *http.Request, id int64) {
