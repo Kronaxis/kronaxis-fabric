@@ -1,0 +1,79 @@
+#!/bin/bash
+# kx-coord-send — POST a message to the Kronaxis multi-session coord channel
+#
+# Usage:
+#   kx-coord-send "X→Y: subject | body"     — letter form (legacy)
+#   kx-coord-send -s X -r Y -t subject -b "body"   — explicit form
+#
+# Sender X may be any letter or session-id. Recipient Y may be 'all' or a letter.
+# Inserts row to coord_messages on DL580 tfs DB; trigger pg_notify pushes to all listeners.
+#
+# Env: KX_PG_HOST (default 192.168.50.129), KX_PG_USER (titan), KX_PG_PASS (from ~/.kronaxis/env or arg), KX_PG_DB (tfs)
+#
+set -euo pipefail
+
+# No env source — operator's ~/.kronaxis/env may have unquoted values that break source.
+# Defaults below pick up sovereign_hardened_2026 + 192.168.50.129 which work in dev.
+# Override via shell env vars before invoking if needed:
+#   KX_PG_HOST=10.66.66.2 KX_PG_PASS=foo ~/bin/kx-coord-send "..."
+:
+
+PG_HOST="${KX_PG_HOST:-192.168.50.129}"
+PG_USER="${KX_PG_USER:-titan}"
+PG_DB="${KX_PG_DB:-tfs}"
+PG_PASS="${KX_PG_PASS:-${TFS_DB_PASSWORD:-sovereign_hardened_2026}}"
+HOST_NAME="$(hostname)"
+
+# Letter-form parsing
+if [[ $# -eq 1 && "$1" =~ ^([A-Za-z0-9_-]+)→([A-Za-z0-9_,-]+):[[:space:]]*([^|]+)\|(.*)$ ]]; then
+  SENDER="${BASH_REMATCH[1]}"
+  RECIPIENT="${BASH_REMATCH[2]}"
+  SUBJECT="${BASH_REMATCH[3]}"
+  BODY="${BASH_REMATCH[4]}"
+elif [[ $# -eq 1 && "$1" =~ ^([A-Za-z0-9_-]+)-\>([A-Za-z0-9_,-]+):[[:space:]]*([^|]+)\|(.*)$ ]]; then
+  # ASCII-arrow variant
+  SENDER="${BASH_REMATCH[1]}"
+  RECIPIENT="${BASH_REMATCH[2]}"
+  SUBJECT="${BASH_REMATCH[3]}"
+  BODY="${BASH_REMATCH[4]}"
+else
+  SENDER=""
+  RECIPIENT=""
+  SUBJECT=""
+  BODY=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -s|--sender) SENDER="$2"; shift 2 ;;
+      -r|--recipient) RECIPIENT="$2"; shift 2 ;;
+      -t|--subject) SUBJECT="$2"; shift 2 ;;
+      -b|--body) BODY="$2"; shift 2 ;;
+      *) echo "kx-coord-send: unrecognised arg $1" >&2; exit 2 ;;
+    esac
+  done
+fi
+
+if [[ -z "$SENDER" || -z "$RECIPIENT" || -z "$SUBJECT" ]]; then
+  cat >&2 <<USAGE
+Usage:
+  kx-coord-send "X→Y: subject | body"
+  kx-coord-send -s X -r Y -t subject -b "body"
+
+Examples:
+  kx-coord-send "F→all: WA persona-15 registered | session bytes at /var/lib/kronaxis/whatsapp/p15.db"
+  kx-coord-send "DL580-claude->A: build complete | go test ./agents/telegram-channel/... 80/80 pass"
+USAGE
+  exit 2
+fi
+
+SENDER_TRIM="${SENDER// /}"
+RECIPIENT_TRIM="${RECIPIENT// /}"
+SUBJECT_TRIM="$(echo "$SUBJECT" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+BODY_TRIM="$(echo "$BODY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB" -q -v ON_ERROR_STOP=1 <<SQL
+INSERT INTO coord_messages (sender, recipient, subject, body, host) VALUES (
+  \$\$${SENDER_TRIM}\$\$, \$\$${RECIPIENT_TRIM}\$\$, \$\$${SUBJECT_TRIM}\$\$, \$\$${BODY_TRIM}\$\$, \$\$${HOST_NAME}\$\$
+);
+SQL
+
+echo "[kx-coord] sent ${SENDER_TRIM}→${RECIPIENT_TRIM}: ${SUBJECT_TRIM}"

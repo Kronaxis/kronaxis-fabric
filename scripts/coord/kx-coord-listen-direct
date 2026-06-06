@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Direct PG LISTEN/NOTIFY client — no ssh wrap.
+
+Reads coord_messages via LISTEN coord_chan. Connects to DL580's PG
+directly (192.168.50.129:5432, tfs db, titan user). Filters messages
+addressed to a given letter or 'all' or 'both' or any list including
+the letter.
+
+Usage:
+    kx-coord-listen-direct --filter D
+    kx-coord-listen-direct --filter D --pretty
+    kx-coord-listen-direct --backfill-hours 4 --filter D
+
+Requires PG to be reachable on 5432 from laptop (LAN access). If
+pg_hba.conf blocks the laptop, set up an ssh -L tunnel:
+    ssh -fNL 5432:localhost:5432 jason@192.168.50.129
+then run with --host 127.0.0.1.
+"""
+import argparse
+import json
+import os
+import select
+import sys
+import time
+from datetime import datetime, timezone
+
+import psycopg2
+import psycopg2.extensions
+
+DEFAULT_HOST = "192.168.50.129"
+DEFAULT_USER = "titan"
+DEFAULT_DB = "tfs"
+DEFAULT_PASS = "sovereign_hardened_2026"
+
+
+def matches_filter(recipient: str, my_letter: str) -> bool:
+    """True if a message tagged with `recipient` is for `my_letter`."""
+    if not my_letter:
+        return True
+    r = (recipient or "").lower()
+    me = my_letter.lower()
+    if r == me:
+        return True
+    if r in ("all", "both"):
+        return True
+    # Comma-list e.g. "a,c,d"
+    parts = [p.strip() for p in r.split(",")]
+    if me in parts:
+        return True
+    return False
+
+
+def fmt_row(row: dict, pretty: bool) -> str:
+    if not pretty:
+        return json.dumps(row)
+    ts = row.get("ts") or ""
+    if isinstance(ts, datetime):
+        ts = ts.strftime("%H:%M:%S")
+    return f"[{ts}] {row['sender']}→{row['recipient']}: {row['subject']} | {row.get('body','')}"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default=os.environ.get("PG_HOST", DEFAULT_HOST))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PG_PORT", "5432")))
+    ap.add_argument("--user", default=os.environ.get("PG_USER", DEFAULT_USER))
+    ap.add_argument("--db", default=os.environ.get("PG_DB", DEFAULT_DB))
+    ap.add_argument("--password", default=os.environ.get("PG_PASSWORD", DEFAULT_PASS))
+    ap.add_argument("--filter", help="my letter (e.g. D); only messages addressed to me or 'all'/'both' will print")
+    ap.add_argument("--pretty", action="store_true")
+    ap.add_argument("--backfill-hours", type=float, default=0,
+                    help="print rows from the last N hours before LISTEN starts")
+    args = ap.parse_args()
+
+    conn = psycopg2.connect(host=args.host, port=args.port, user=args.user,
+                            dbname=args.db, password=args.password,
+                            connect_timeout=10)
+    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    cur = conn.cursor()
+
+    print(f"[kx-coord-direct] connected to PG {args.host}:{args.port}/{args.db} filter={args.filter or '*'}", flush=True)
+
+    # Optional backfill
+    if args.backfill_hours > 0:
+        cur.execute(
+            "SELECT id, ts, sender, recipient, subject, body, host "
+            "FROM coord_messages "
+            "WHERE ts > now() - (%s || ' hours')::interval "
+            "ORDER BY ts ASC",
+            (str(args.backfill_hours),),
+        )
+        for r_id, ts, sender, recipient, subj, body, host in cur.fetchall():
+            if not matches_filter(recipient, args.filter):
+                continue
+            print(fmt_row({"id": r_id, "ts": ts, "sender": sender,
+                           "recipient": recipient, "subject": subj,
+                           "body": body, "host": host}, args.pretty), flush=True)
+        print(f"[kx-coord-direct] backfill done — switching to LISTEN", flush=True)
+
+    cur.execute("LISTEN coord_chan;")
+
+    # poll-wait loop
+    last_id_seen = 0
+    cur.execute("SELECT COALESCE(MAX(id), 0) FROM coord_messages")
+    last_id_seen = cur.fetchone()[0]
+
+    while True:
+        # 30s poll cycle keeps the connection alive even if no notifies arrive
+        if select.select([conn], [], [], 30) == ([], [], []):
+            # timeout — refresh
+            conn.poll()
+        else:
+            conn.poll()
+        while conn.notifies:
+            n = conn.notifies.pop(0)
+            # Notification payload is just the row id from the trigger
+            try:
+                payload_id = int(n.payload)
+            except (ValueError, TypeError):
+                payload_id = None
+            if payload_id and payload_id <= last_id_seen:
+                continue
+            # Fetch the row by id (or by max id since last_id_seen if id missing)
+            cur.execute(
+                "SELECT id, ts, sender, recipient, subject, body, host "
+                "FROM coord_messages WHERE id > %s ORDER BY id ASC",
+                (last_id_seen,),
+            )
+            for r_id, ts, sender, recipient, subj, body, host in cur.fetchall():
+                last_id_seen = max(last_id_seen, r_id)
+                if not matches_filter(recipient, args.filter):
+                    continue
+                print(fmt_row({"id": r_id, "ts": ts, "sender": sender,
+                               "recipient": recipient, "subject": subj,
+                               "body": body, "host": host}, args.pretty), flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main() or 0)
+    except KeyboardInterrupt:
+        sys.exit(0)

@@ -1,0 +1,65 @@
+#!/bin/bash
+# kx-coord-listen — LISTEN to the Kronaxis multi-session coord channel
+#
+# Pushes new messages to stdout as JSON-per-line, real-time via pg_notify.
+# Use --filter LETTER to only show messages addressed to that letter (or 'all').
+#
+# Usage:
+#   kx-coord-listen                  — show all messages
+#   kx-coord-listen --filter F       — only show messages where recipient = F or all
+#   kx-coord-listen --pretty         — human-readable line format
+#
+set -euo pipefail
+
+# No env source — defaults work in dev. Override via KX_PG_* shell vars if needed.
+:
+
+PG_HOST="${KX_PG_HOST:-192.168.50.129}"
+PG_USER="${KX_PG_USER:-titan}"
+PG_DB="${KX_PG_DB:-tfs}"
+PG_PASS="${KX_PG_PASS:-${TFS_DB_PASSWORD:-sovereign_hardened_2026}}"
+
+FILTER=""
+PRETTY=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --filter) FILTER="$2"; shift 2 ;;
+    --pretty) PRETTY=1; shift ;;
+    *) echo "kx-coord-listen: unrecognised arg $1" >&2; exit 2 ;;
+  esac
+done
+
+echo "[kx-coord] listening on coord_chan (PG_HOST=$PG_HOST DB=$PG_DB)$([ -n "$FILTER" ] && echo " filter=$FILTER")"
+
+PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB" -q --no-align --field-separator='	' <<SQL | while IFS= read -r LINE; do
+LISTEN coord_chan;
+SELECT pg_sleep(86400);
+SQL
+  # psql output: "Asynchronous notification \"coord_chan\" with payload \"...\" received from server process with PID..."
+  if [[ "$LINE" =~ Asynchronous\ notification\ \"coord_chan\"\ with\ payload\ \"(.*)\"\ received ]]; then
+    PAYLOAD="${BASH_REMATCH[1]}"
+    # Strip backslash escaping psql adds to the JSON
+    PAYLOAD_CLEAN="$(echo "$PAYLOAD" | sed 's/\\"/"/g')"
+
+    # Filter by recipient if requested
+    if [[ -n "$FILTER" ]]; then
+      REC="$(echo "$PAYLOAD_CLEAN" | sed -n 's/.*"recipient"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      if [[ "$REC" != "$FILTER" && "$REC" != "all" ]]; then
+        continue
+      fi
+    fi
+
+    if [[ "$PRETTY" -eq 1 ]]; then
+      TS="$(echo "$PAYLOAD_CLEAN" | sed -n 's/.*"ts"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      SEND="$(echo "$PAYLOAD_CLEAN" | sed -n 's/.*"sender"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      REC="$(echo "$PAYLOAD_CLEAN" | sed -n 's/.*"recipient"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      SUB="$(echo "$PAYLOAD_CLEAN" | sed -n 's/.*"subject"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      BOD="$(echo "$PAYLOAD_CLEAN" | sed -n 's/.*"body"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      HST="$(echo "$PAYLOAD_CLEAN" | sed -n 's/.*"host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+      echo "[$TS] $SEND@$HST → $REC: $SUB | $BOD"
+    else
+      echo "$PAYLOAD_CLEAN"
+    fi
+  fi
+done

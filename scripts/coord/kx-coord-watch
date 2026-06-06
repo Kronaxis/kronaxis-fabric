@@ -1,0 +1,136 @@
+#!/bin/bash
+# kx-coord-watch — terminal viewer for the Kronaxis multi-session coord channel
+#
+# Shows recent history then follows live messages via sub-ms pg_notify push.
+# Default uses `less +F` so you can pause to scroll/search and resume follow.
+#
+# Usage:
+#   kx-coord-watch                       last 200 messages + follow in a pager
+#   kx-coord-watch -n 50                 history depth
+#   kx-coord-watch --filter C            only msgs to C or 'all' or 'both'
+#   kx-coord-watch --since '2h ago'      start history N ago
+#   kx-coord-watch --live                stream straight to terminal (no pager)
+#   kx-coord-watch --no-color            plain output
+#
+# Inside `less +F`:
+#   Ctrl+C       stop follow, scroll mode
+#   PgUp/PgDn    scroll page
+#   ↑/↓          scroll line
+#   /pattern     search forward
+#   ?pattern     search back
+#   n / N        next / previous match
+#   F            resume follow
+#   q            quit
+#
+# Colour map (sender):
+#   A=red  B=green  C=yellow  D=blue  E=magenta
+#   MAIN=bold-red  DL580*=bold-green  R920*=bold-magenta  other=cyan
+#
+# Backend: PostgreSQL tfs.coord_messages on 192.210... (KX_PG_HOST=192.168.50.129)
+
+set -euo pipefail
+[ -f ~/.kronaxis/env ] && source ~/.kronaxis/env
+
+PG_HOST="${KX_PG_HOST:-192.168.50.129}"
+PG_USER="${KX_PG_USER:-titan}"
+PG_DB="${KX_PG_DB:-tfs}"
+PG_PASS="${KX_PG_PASS:-${TFS_DB_PASSWORD:-sovereign_hardened_2026}}"
+
+LINES=200
+FILTER=""
+SINCE=""
+LIVE=0
+NO_COLOR_FLAG=0
+
+[ -n "${NO_COLOR:-}" ] && NO_COLOR_FLAG=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--lines) LINES="$2"; shift 2 ;;
+    --filter) FILTER="$2"; shift 2 ;;
+    --since) SINCE="$2"; shift 2 ;;
+    --live) LIVE=1; shift ;;
+    --no-color|--no-colour) NO_COLOR_FLAG=1; shift ;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# //; s/^#//'; exit 0 ;;
+    *) echo "kx-coord-watch: unrecognised arg $1" >&2; exit 2 ;;
+  esac
+done
+
+WHERE="WHERE TRUE"
+if [[ -n "$FILTER" ]]; then
+  WHERE="$WHERE AND (recipient = '$FILTER' OR recipient IN ('all','both') OR recipient LIKE '%${FILTER}%')"
+fi
+if [[ -n "$SINCE" ]]; then
+  WHERE="$WHERE AND ts > now() - interval '$SINCE'"
+fi
+
+# Detect perl availability for colourise; degrade to plain if missing
+COLOR_OK=0
+if [[ $NO_COLOR_FLAG -eq 0 ]] && command -v perl >/dev/null 2>&1; then
+  COLOR_OK=1
+fi
+
+# Perl colourise: parse "[TS] SENDER@HOST → RECIPIENT: SUBJECT | BODY" lines and ANSI-colour them
+# Supports both → unicode arrow and -> ASCII arrow.
+colourise() {
+  if [[ $COLOR_OK -eq 0 ]]; then
+    cat
+    return
+  fi
+  perl -e '
+    my %map = (A => "31", B => "32", C => "33", D => "34", E => "35", MAIN => "1;31");
+    while (<STDIN>) {
+      chomp;
+      if (/^\[([^\]]+)\]\s+(\S+?)(@\S+)?\s*(?:→|->)\s*(\S+?):\s+(.+?)\s*\|\s*(.*)$/) {
+        my ($ts, $sender, $host, $recipient, $subject, $body) = ($1, $2, $3 // "", $4, $5, $6);
+        my $sc = $map{$sender}
+              // ($sender =~ /^DL580/ ? "1;32"
+                 : $sender =~ /^R920/  ? "1;35"
+                 : "36");
+        printf "\e[2m[%s]\e[0m \e[%sm%s\e[0m\e[2m%s\e[0m → \e[%sm%s\e[0m: \e[1m%s\e[0m | %s\n",
+               $ts, $sc, $sender, $host, $sc, $recipient, $subject, $body;
+      } else {
+        # Pass-through (banner / separator lines)
+        print "$_\n";
+      }
+    }
+  '
+}
+
+# Emit history (oldest → newest)
+emit_history() {
+  PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB" -q -A -t <<SQL
+SELECT '[' || to_char(ts at time zone 'UTC', 'YYYY-MM-DD HH24:MI:SS') || 'Z] ' ||
+       sender || '@' || coalesce(host,'?') || ' → ' || recipient || ': ' ||
+       subject || ' | ' || body
+FROM (SELECT * FROM coord_messages $WHERE ORDER BY ts DESC LIMIT $LINES) sub
+ORDER BY ts ASC;
+SQL
+}
+
+# Live tail via kx-coord-listen --pretty
+emit_live() {
+  local args=( --pretty )
+  [ -n "$FILTER" ] && args=( --filter "$FILTER" --pretty )
+  exec ~/bin/kx-coord-listen "${args[@]}" 2>&1
+}
+
+# Compose: history + separator + live, colourised, then pager (unless --live)
+stream() {
+  emit_history
+  printf '\n=== live (sub-ms pg_notify push) — Ctrl+C to scroll · F to resume follow · q to quit ===\n\n'
+  emit_live
+}
+
+if [[ $LIVE -eq 1 ]]; then
+  stream | colourise
+else
+  # less options:
+  #   -R   render ANSI colour
+  #   -X   do not clear screen on exit (keep history visible)
+  #   -F   quit if content fits in one screen (after the user q's)
+  #   +F   start in follow mode
+  #   -i   case-insensitive search
+  #   -S   chop long lines instead of wrapping (more readable for one-line-per-msg)
+  stream | colourise | less -RXFiS +F
+fi

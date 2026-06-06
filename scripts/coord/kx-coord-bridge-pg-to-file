@@ -1,0 +1,33 @@
+#!/bin/bash
+# kx-coord-bridge-pg-to-file — daemon that mirrors PG coord_messages → /home/jason/.kronaxis/coord/chan.log
+#
+# So legacy sessions A-E that tail chan.log still see new PG-channel messages.
+#
+# Run via:
+#   nohup ~/bin/kx-coord-bridge-pg-to-file >> /tmp/kx-coord-bridge.log 2>&1 &
+#
+# Stop: pkill -f kx-coord-bridge-pg-to-file
+#
+set -uo pipefail
+
+CHAN_LOG="/home/jason/.kronaxis/coord/chan.log"
+
+# Marker file tracks last-seen PG id to avoid re-mirroring on restart
+MARK_FILE="/home/jason/.kronaxis/coord/.pg_bridge_last_id"
+LAST_ID=$(cat "$MARK_FILE" 2>/dev/null || echo 0)
+
+PG_HOST="${KX_PG_HOST:-192.168.50.129}"
+PG_PASS="${TFS_DB_PASSWORD:-sovereign_hardened_2026}"
+
+while true; do
+  ROWS=$(ssh -o ConnectTimeout=5 jason@$PG_HOST "PGPASSWORD=$PG_PASS psql -h 127.0.0.1 -U titan -d tfs -t -A -F '|' -c \"SELECT id, to_char(ts, 'YYYY-MM-DD\\\"T\\\"HH24:MI:SS\\\"Z\\\"'), sender, host, recipient, subject, replace(body, chr(10), ' ') FROM coord_messages WHERE id > $LAST_ID ORDER BY id ASC LIMIT 100\"" 2>/dev/null)
+  if [ -n "$ROWS" ]; then
+    while IFS='|' read -r ID TS SEND HOST REC SUB BODY; do
+      [ -z "$ID" ] && continue
+      echo "[$TS] $SEND@$HOST→$REC: $SUB | $BODY  [pg-id=$ID]" >> "$CHAN_LOG"
+      LAST_ID="$ID"
+    done <<< "$ROWS"
+    echo "$LAST_ID" > "$MARK_FILE"
+  fi
+  sleep 2
+done

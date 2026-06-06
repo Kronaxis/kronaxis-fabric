@@ -1,0 +1,79 @@
+#!/bin/bash
+# kx-coord-pending — drain unread coord messages addressed to this session.
+#
+# Designed to be invoked from a user-prompt-submit hook so every turn
+# automatically receives anything peers sent us since the last turn.
+#
+# Reads ~/.kx-session/<recipient>.last-seen (epoch seconds), queries PG for
+# coord_messages with recipient IN (<recipient>, 'all') AND ts > last_seen,
+# prints them as compact lines, and updates last-seen unless --no-update.
+#
+# Usage:
+#   kx-coord-pending --recipient <session_name>
+#   kx-coord-pending --recipient <session_name> --no-update    # peek without consuming
+#   kx-coord-pending --recipient <session_name> --since <epoch> # override start
+#
+# Exit codes:
+#   0 — success (may be no messages)
+#   1 — DB error
+#   2 — bad args
+#
+set -euo pipefail
+
+PG_HOST="${KX_PG_HOST:-192.168.50.129}"
+PG_USER="${KX_PG_USER:-titan}"
+PG_DB="${KX_PG_DB:-tfs}"
+PG_PASS="${KX_PG_PASS:-${TFS_DB_PASSWORD:-sovereign_hardened_2026}}"
+
+RECIPIENT=""
+NO_UPDATE=0
+OVERRIDE_SINCE=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --recipient) RECIPIENT="$2"; shift 2 ;;
+    --no-update) NO_UPDATE=1; shift ;;
+    --since)     OVERRIDE_SINCE="$2"; shift 2 ;;
+    *) echo "kx-coord-pending: unrecognised arg $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$RECIPIENT" ]; then
+  echo "kx-coord-pending: --recipient is required" >&2
+  exit 2
+fi
+
+STATE_DIR="${HOME}/.kx-session"
+mkdir -p "$STATE_DIR"
+LAST_SEEN_FILE="${STATE_DIR}/${RECIPIENT}.last-seen"
+
+if [ -n "$OVERRIDE_SINCE" ]; then
+  SINCE="$OVERRIDE_SINCE"
+elif [ -f "$LAST_SEEN_FILE" ]; then
+  SINCE=$(cat "$LAST_SEEN_FILE")
+else
+  SINCE=$(date -u +%s)
+fi
+
+# Convert epoch to PG TIMESTAMPTZ
+SINCE_ISO=$(date -u -d "@$SINCE" -Iseconds)
+NOW_ISO=$(date -u -Iseconds)
+
+PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB" -At -F $'\t' \
+  -c "SELECT id, ts, sender, recipient, subject, body \
+      FROM public.coord_messages \
+      WHERE ts > '$SINCE_ISO'::timestamptz \
+        AND (recipient = '$RECIPIENT' OR recipient = 'all') \
+      ORDER BY ts ASC" 2>/dev/null | \
+while IFS=$'\t' read -r id ts sender recipient subject body; do
+  if [ -n "$id" ]; then
+    # Truncate body to 400 chars for hook context safety
+    printf '[coord #%s %s] %s→%s: %s | %s\n' \
+      "$id" "$(echo "$ts" | cut -d. -f1)" "$sender" "$recipient" "$subject" "${body:0:400}"
+  fi
+done
+
+# Update last-seen unless caller asked us not to
+if [ "$NO_UPDATE" -eq 0 ]; then
+  date -u +%s > "$LAST_SEEN_FILE"
+fi

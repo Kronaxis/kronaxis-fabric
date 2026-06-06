@@ -1,0 +1,12 @@
+[Unit]
+Description=Kronaxis coord bootstrap for host-canonical session
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '/home/operator/bin/kx-session-bootstrap "$(hostname -s | sed s/-.*//)"'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target

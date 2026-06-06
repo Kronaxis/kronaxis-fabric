@@ -1,0 +1,98 @@
+#!/bin/bash
+# kx-session-bootstrap — first action of every Kronaxis session.
+#
+# Arms cross-session coord listener, verifies fabric is up, surfaces yesterday's
+# memos for this session, and registers presence so peers can see who's alive.
+#
+# Usage:
+#   kx-session-bootstrap <session_name>
+#
+# Example:
+#   kx-session-bootstrap voice
+#
+# Side effects:
+#   - tails kx-coord-listen --filter <session> to /tmp/coord-<session>.log
+#   - writes ~/.kx-session/<session>.pid
+#   - writes ~/.kx-session/<session>.last-seen (epoch) for kx-coord-pending
+#
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: kx-session-bootstrap <session_name>" >&2
+  exit 2
+fi
+
+SESSION="$1"
+STATE_DIR="${HOME}/.kx-session"
+mkdir -p "$STATE_DIR"
+# Per-shell-session-id state so N concurrent sessions on one host don't clobber
+# each other. sid is the controlling-terminal session id of THIS shell — every
+# Claude Code instance has its own pty so its own sid.
+SID=$(ps -o sid= -p $$ | tr -d ' ')
+echo "$SESSION" > "${STATE_DIR}/sid-${SID}.name"
+# Back-compat: still write 'current' for any legacy reader (deprecated).
+echo "$SESSION" > "${STATE_DIR}/current"
+LOG_FILE="/tmp/coord-${SESSION}.log"
+PID_FILE="${STATE_DIR}/${SESSION}.pid"
+LAST_SEEN_FILE="${STATE_DIR}/${SESSION}.last-seen"
+
+FABRIC_URL="${FABRIC_URL:-http://192.168.50.129:8201}"
+FABRIC_KEY="${FABRIC_KEY:-test-key-1}"
+
+echo "=== kx-session-bootstrap: $SESSION ==="
+
+# 1) Kill any prior listener under this name so we don't double-tail.
+if [ -f "$PID_FILE" ]; then
+  OLD_PID=$(cat "$PID_FILE" 2>/dev/null || echo "")
+  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 0.2
+  fi
+fi
+
+# 2) Arm coord listener filtered on this session. Background, log to file.
+nohup ~/bin/kx-coord-listen --filter "$SESSION" --pretty \
+  >> "$LOG_FILE" 2>&1 &
+echo $! > "$PID_FILE"
+echo "[bootstrap] coord listener armed (pid=$(cat $PID_FILE), log=$LOG_FILE)"
+
+# 3) Init last-seen now so kx-coord-pending only shows new messages from now on.
+date -u +%s > "$LAST_SEEN_FILE"
+
+# 4) Verify fabric is alive.
+if ! curl -fsS -m 3 -H "Authorization: Bearer $FABRIC_KEY" \
+     "$FABRIC_URL/v1/health" >/dev/null 2>&1; then
+  echo "[bootstrap] FABRIC DOWN — investigate before proceeding (URL=$FABRIC_URL)"
+  exit 3
+fi
+echo "[bootstrap] fabric OK ($FABRIC_URL)"
+
+# 5) Pull last-known state for this session topic so we don't restart cold.
+echo "[bootstrap] recent memos relevant to '$SESSION':"
+RESPONSE=$(curl -fsS -m 5 -X POST \
+  -H "Authorization: Bearer $FABRIC_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"query\":\"$SESSION last-state\",\"top_k\":3,\"mode\":\"hybrid\"}" \
+  "$FABRIC_URL/v1/memo/search" 2>/dev/null || echo '{"results":[]}')
+echo "$RESPONSE" | python3 -c "
+import sys, json
+try:
+    r = json.load(sys.stdin)
+    for m in r.get('results', [])[:3]:
+        title = m.get('title','')[:120]
+        score = m.get('score', 0)
+        print(f'  #{m[\"id\"]}  score {score:.2f}  {title}')
+except Exception as e:
+    print(f'  (memo parse error: {e})')
+"
+
+# 6) Show any unread coord backlog directed at us.
+BACKLOG=$(~/bin/kx-coord-pending --recipient "$SESSION" --no-update 2>/dev/null || echo "")
+if [ -n "$BACKLOG" ]; then
+  echo "[bootstrap] unread coord for $SESSION:"
+  echo "$BACKLOG" | sed 's/^/  /'
+else
+  echo "[bootstrap] no unread coord for $SESSION"
+fi
+
+echo "[bootstrap] ready — session $SESSION registered"

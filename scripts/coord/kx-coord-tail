@@ -1,0 +1,60 @@
+#!/bin/bash
+# kx-coord-tail — show recent coord messages + LISTEN for new ones (like `tail -F` but PG-backed)
+#
+# Usage:
+#   kx-coord-tail                    — last 20 messages then follow
+#   kx-coord-tail -n 50              — last 50 messages then follow
+#   kx-coord-tail --filter F         — only messages where recipient = F or all
+#   kx-coord-tail --since '2h ago'   — messages from N ago, follow forward
+#
+set -euo pipefail
+
+# No env source — defaults work in dev. Override via KX_PG_* shell vars if needed.
+:
+
+PG_HOST="${KX_PG_HOST:-192.168.50.129}"
+PG_USER="${KX_PG_USER:-titan}"
+PG_DB="${KX_PG_DB:-tfs}"
+PG_PASS="${KX_PG_PASS:-${TFS_DB_PASSWORD:-sovereign_hardened_2026}}"
+
+LINES=20
+FILTER=""
+SINCE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--lines) LINES="$2"; shift 2 ;;
+    --filter) FILTER="$2"; shift 2 ;;
+    --since) SINCE="$2"; shift 2 ;;
+    *) echo "kx-coord-tail: unrecognised arg $1" >&2; exit 2 ;;
+  esac
+done
+
+# Build WHERE clause
+WHERE="WHERE TRUE"
+if [[ -n "$FILTER" ]]; then
+  WHERE="$WHERE AND (recipient = '$FILTER' OR recipient = 'all')"
+fi
+if [[ -n "$SINCE" ]]; then
+  WHERE="$WHERE AND ts > now() - interval '$SINCE'"
+fi
+
+# Print recent first (ascending ts so latest is at bottom)
+PGPASSWORD="$PG_PASS" psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB" -q --no-align --field-separator=' | ' -t <<SQL
+SELECT
+  '[' || to_char(ts, 'YYYY-MM-DD HH24:MI:SS') || '] ' ||
+  sender || '@' || host || ' → ' || recipient || ': ' || subject || ' | ' || body
+FROM (
+  SELECT * FROM coord_messages
+  $WHERE
+  ORDER BY ts DESC
+  LIMIT $LINES
+) sub
+ORDER BY ts ASC;
+SQL
+
+# Then follow
+echo "--- LIVE (Ctrl+C to stop) ---"
+FILTER_ARG=()
+[ -n "$FILTER" ] && FILTER_ARG=("--filter" "$FILTER")
+exec "$(dirname "$0")/kx-coord-listen" --pretty "${FILTER_ARG[@]}"
