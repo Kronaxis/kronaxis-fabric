@@ -96,3 +96,24 @@ else
 fi
 
 echo "[bootstrap] ready — session $SESSION registered"
+
+# 7) PUSH-WAITER — print the arm instructions for the agent to invoke as its
+#    own run_in_background Bash tool call. Per coord-protocol GR §46 every
+#    session arms a push-waiter immediately after bootstrap and re-arms on
+#    each fire; the UserPromptSubmit pull-hook stays as the backstop.
+PUSH_ARM_BIN="$(command -v kx-coord-push-arm 2>/dev/null || true)"
+[ -z "$PUSH_ARM_BIN" ] && [ -x "$HOME/bin/kx-coord-push-arm" ] && PUSH_ARM_BIN="$HOME/bin/kx-coord-push-arm"
+SCRIPT_DIR_GUESS="$(dirname "$(readlink -f "$0")")"
+[ -z "$PUSH_ARM_BIN" ] && [ -x "$SCRIPT_DIR_GUESS/kx-coord-push-arm" ] && PUSH_ARM_BIN="$SCRIPT_DIR_GUESS/kx-coord-push-arm"
+
+if [ -n "$PUSH_ARM_BIN" ]; then
+  echo ""
+  echo "================================================================"
+  echo "ARM YOUR COORD PUSH-WAITER NOW (Golden Rule §46)"
+  echo "================================================================"
+  "$PUSH_ARM_BIN" "$SESSION"
+  echo "================================================================"
+  echo ""
+else
+  echo "[bootstrap] WARN: kx-coord-push-arm not found; install it and re-bootstrap."
+fi

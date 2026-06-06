@@ -1,0 +1,52 @@
+#!/bin/bash
+# kx-coord-push-wait — block until a new coord_messages row addressed to
+# <session> or 'all' lands; print id|sender|subject lines then exit 0.
+#
+# Invoked by an agent as a run_in_background Bash tool call. On exit the
+# Claude Code harness re-invokes the agent, which drains the full backlog
+# (kx-coord-pending) and re-arms by invoking this command again.
+#
+# Usage:
+#   kx-coord-push-wait <session> [lastid_file]
+#
+# Defaults:
+#   lastid_file = /tmp/<session>_coord_lastid
+#   KX_PUSH_TIMEOUT_SEC = 3300    (~55min self-heal idle re-arm)
+#   KX_PUSH_POLL_SEC    = 3
+#
+# Exits 0 on first new message AND on idle timeout (both trigger re-invoke).
+#
+set -u
+
+SESS="${1:?session name required}"
+LASTF="${2:-/tmp/${SESS}_coord_lastid}"
+
+PG_HOST="${KX_PG_HOST:-192.168.50.129}"
+PG_USER="${KX_PG_USER:-titan}"
+PG_DB="${KX_PG_DB:-tfs}"
+export PGPASSWORD="${KX_PG_PASS:-${TFS_DB_PASSWORD:-sovereign_hardened_2026}}"
+TIMEOUT_SEC="${KX_PUSH_TIMEOUT_SEC:-3300}"
+POLL_SEC="${KX_PUSH_POLL_SEC:-3}"
+
+PSQL() { psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB" -tAF'|' -c "$1" 2>/dev/null; }
+
+BASE="$(cat "$LASTF" 2>/dev/null)"
+if [ -z "$BASE" ]; then
+  BASE="$(PSQL "select coalesce(max(id),0) from coord_messages;")"
+  BASE="${BASE:-0}"
+fi
+
+END=$(( SECONDS + TIMEOUT_SEC ))
+while [ "$SECONDS" -lt "$END" ]; do
+  ROWS="$(PSQL "select id||'|'||sender||'|'||left(coalesce(subject,body),120) from coord_messages where id > ${BASE} and recipient in ('${SESS}','all') order by id;")"
+  if [ -n "$ROWS" ]; then
+    echo "$ROWS"
+    NEWMAX="$(printf '%s\n' "$ROWS" | tail -1 | cut -d'|' -f1)"
+    echo "$NEWMAX" > "$LASTF"
+    exit 0
+  fi
+  sleep "$POLL_SEC"
+done
+
+echo "[push-wait] idle timeout — re-arm"
+exit 0

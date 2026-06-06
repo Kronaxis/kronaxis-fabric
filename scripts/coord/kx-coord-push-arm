@@ -1,0 +1,110 @@
+#!/bin/bash
+# kx-coord-push-arm — emit the exact run_in_background command an agent must
+# execute as its OWN tool call to receive PUSHED coord messages.
+#
+# The harness re-invokes a Claude Code agent whenever one of its
+# run_in_background Bash tool calls exits. This script does NOT block by itself;
+# it PRINTS the waiter command for the agent to invoke. (A shell-launched daemon
+# canNOT re-invoke the agent — the tool call must be owned by the agent.)
+#
+# Mechanism:
+#   1. Agent runs kx-coord-push-arm <session> -> prints command + waiter body
+#      to STDERR for the human/agent operator to copy.
+#   2. Agent invokes the printed command as run_in_background Bash.
+#   3. Command polls coord_messages on the tfs DB for rows addressed to
+#      <session> or 'all' with id > last-seen baseline; on first new row,
+#      prints it and exits 0. Harness fires the agent.
+#   4. Agent drains FULL backlog (kx-coord-pending --recipient <session>) and
+#      RE-ARMS by invoking the same command again as run_in_background. A
+#      single message can land between fire and re-arm; trust the drain, not
+#      the single grepped line.
+#
+# Self-heal: waiter has ~55 min wall-clock cap so an idle waiter exits, harness
+# re-invokes, agent re-arms — no stuck waiters past one prompt-cache lifetime.
+#
+# Usage:
+#   kx-coord-push-arm <session>            # print arm instructions for <session>
+#   kx-coord-push-arm <session> --quiet    # print only the command (no banner)
+#   kx-coord-push-arm <session> --exec     # run the waiter inline (testing only)
+#
+# Env:
+#   KX_PG_HOST (default 192.168.50.129)
+#   KX_PG_USER (default titan)
+#   KX_PG_DB   (default tfs)
+#   KX_PG_PASS / TFS_DB_PASSWORD (default sovereign_hardened_2026 — dev)
+#   KX_PUSH_TIMEOUT_SEC (default 3300 — ~55min, under prompt-cache TTL fallback)
+#   KX_PUSH_POLL_SEC    (default 3 — DB poll interval)
+#
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  cat >&2 <<USAGE
+Usage: kx-coord-push-arm <session> [--quiet|--exec]
+
+  Prints the run_in_background Bash command an agent must invoke to receive
+  PUSHED coord messages. Re-arm after every fire. Drain full backlog on fire.
+
+  --quiet : print only the command (one line), no banner
+  --exec  : run the waiter inline now (for shell testing — NOT for agents)
+USAGE
+  exit 2
+fi
+
+SESSION="$1"
+MODE="instructions"
+case "${2:-}" in
+  --quiet) MODE="quiet" ;;
+  --exec)  MODE="exec" ;;
+  "")      ;;
+  *) echo "kx-coord-push-arm: unrecognised arg $2" >&2; exit 2 ;;
+esac
+
+LASTID_FILE="/tmp/${SESSION}_coord_lastid"
+TIMEOUT_SEC="${KX_PUSH_TIMEOUT_SEC:-3300}"
+POLL_SEC="${KX_PUSH_POLL_SEC:-3}"
+PG_HOST="${KX_PG_HOST:-192.168.50.129}"
+PG_USER="${KX_PG_USER:-titan}"
+PG_DB="${KX_PG_DB:-tfs}"
+
+# Delegate to the wrapper script so the agent's run_in_background line is
+# short and free of nested-quote hell. Wrapper lives next to this script
+# (and is also installed into ~/bin during propagation).
+WRAPPER="$(dirname "$(readlink -f "$0")")/kx-coord-push-wait"
+[ -x "$WRAPPER" ] || WRAPPER="$HOME/bin/kx-coord-push-wait"
+EMIT="$WRAPPER \"$SESSION\""
+
+case "$MODE" in
+  quiet)
+    printf '%s\n' "$EMIT"
+    ;;
+  exec)
+    exec "$WRAPPER" "$SESSION"
+    ;;
+  instructions)
+    cat <<BANNER
+=== kx-coord-push-arm: $SESSION ===
+PUSH-WAITER — agents must invoke the following as a run_in_background Bash
+tool call to receive pushed coord messages. The harness re-invokes you when
+this command exits (on first new message OR ~55-min idle re-arm).
+
+run_in_background command:
+
+  $EMIT
+
+ON EVERY FIRE:
+  1. Read the printed coord line.
+  2. Drain the full backlog (do NOT trust the single grep):
+        kx-coord-pending --recipient $SESSION
+  3. RE-ARM by invoking the same run_in_background command again.
+  4. Respond to coord items that need a reply.
+
+State file: $LASTID_FILE   (last-seen coord id baseline)
+Idle re-arm cap: ${TIMEOUT_SEC}s
+DB poll: ${POLL_SEC}s
+DB: $PG_USER@$PG_HOST/$PG_DB
+
+The UserPromptSubmit pull-hook (kx-coord-pending-hook) remains the BACKSTOP
+for messages the waiter missed. Pull + push = belt and braces.
+BANNER
+    ;;
+esac
