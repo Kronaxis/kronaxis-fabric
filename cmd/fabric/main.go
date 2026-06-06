@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,47 +22,28 @@ import (
 	pgvector "github.com/pgvector/pgvector-go"
 )
 
-const version = "0.10.0"
+const version = "0.11.0-multi-tenant"
 
 const embeddingDim = 768
 const embeddingModel = "nomic-embed-text"
 
+// schemaSQL — boot-time DDL for GLOBAL (non-tenant-scoped) infrastructure.
+// Per spec Section 3.4, these tables stay outside any tenant schema:
+//   - public.coord_messages (existing)
+//   - fabric.sessions / tasks / federation_peers / router_observations
+//
+// Per-tenant tables (memos, symbols, symbol_edges, chunks, prospect_interactions)
+// are NOT created here — they live in per-tenant schemas managed by meta.go /
+// provisionTenant. For tenant-zero, migration 20260527_003 moves the original
+// fabric.memos/symbols/symbol_edges into tenant_00000000.
 const schemaSQL = `
 CREATE SCHEMA IF NOT EXISTS fabric;
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- ---------- memos (v0.2) ----------
-CREATE TABLE IF NOT EXISTS fabric.memos (
-  id BIGSERIAL PRIMARY KEY,
-  title TEXT NOT NULL DEFAULT '',
-  content TEXT NOT NULL,
-  type TEXT NOT NULL DEFAULT 'general',
-  tags TEXT[] NOT NULL DEFAULT '{}',
-  sha256 TEXT NOT NULL,
-  tsv tsvector GENERATED ALWAYS AS (
-    setweight(to_tsvector('english', coalesce(title,'')), 'A') ||
-    setweight(to_tsvector('english', content), 'B')
-  ) STORED,
-  embedding vector(768),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  deleted_at TIMESTAMPTZ,
-  CONSTRAINT memos_sha256_uniq UNIQUE (sha256)
-);
-
-ALTER TABLE fabric.memos ADD COLUMN IF NOT EXISTS embedding vector(768);
-ALTER TABLE fabric.memos ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
-ALTER TABLE fabric.memos ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-
-CREATE INDEX IF NOT EXISTS memos_tsv_idx ON fabric.memos USING gin (tsv);
-CREATE INDEX IF NOT EXISTS memos_type_idx ON fabric.memos (type) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS memos_created_idx ON fabric.memos (created_at DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS memos_embedding_ivf ON fabric.memos USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-
 -- coord_messages may already exist in public; ensure origin_host column for v0.7.
 ALTER TABLE IF EXISTS public.coord_messages ADD COLUMN IF NOT EXISTS origin_host TEXT NOT NULL DEFAULT 'local';
 
--- ---------- v0.5 code graph ----------
+-- ---------- v0.5 code graph (GLOBAL — codebase is one corpus across tenants) ----------
 CREATE TABLE IF NOT EXISTS fabric.symbols (
   id BIGSERIAL PRIMARY KEY,
   repo TEXT NOT NULL,
@@ -92,7 +74,7 @@ CREATE INDEX IF NOT EXISTS symbols_name_idx ON fabric.symbols (symbol_name) WHER
 CREATE INDEX IF NOT EXISTS symbols_file_idx ON fabric.symbols (repo, file_path) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS symbols_emb_ivf ON fabric.symbols USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 
--- ---------- v0.6 orchestrator ----------
+-- ---------- v0.6 orchestrator (GLOBAL) ----------
 CREATE TABLE IF NOT EXISTS fabric.sessions (
   id TEXT PRIMARY KEY,
   host TEXT NOT NULL,
@@ -124,7 +106,7 @@ CREATE INDEX IF NOT EXISTS sessions_heartbeat_idx ON fabric.sessions (last_heart
 CREATE INDEX IF NOT EXISTS tasks_status_idx ON fabric.tasks (status, created_at);
 CREATE INDEX IF NOT EXISTS tasks_assigned_idx ON fabric.tasks (assigned_session) WHERE status IN ('claimed','in_progress');
 
--- ---------- v0.7 federation ----------
+-- ---------- v0.7 federation (GLOBAL) ----------
 CREATE TABLE IF NOT EXISTS fabric.federation_peers (
   id TEXT PRIMARY KEY,
   url TEXT NOT NULL,
@@ -133,7 +115,7 @@ CREATE TABLE IF NOT EXISTS fabric.federation_peers (
   last_pull_high_water BIGINT NOT NULL DEFAULT 0
 );
 
--- ---------- v0.8 router observations ----------
+-- ---------- v0.8 router observations (GLOBAL) ----------
 CREATE TABLE IF NOT EXISTS fabric.router_observations (
   id BIGSERIAL PRIMARY KEY,
   request_hash TEXT NOT NULL,
@@ -148,36 +130,51 @@ CREATE TABLE IF NOT EXISTS fabric.router_observations (
 
 CREATE INDEX IF NOT EXISTS router_obs_category_model_idx
   ON fabric.router_observations (task_category, model_id, observed_at DESC);
-
--- ---------- v0.10 RAG chunks (Router <-> Fabric integration) ----------
--- Code/doc chunks for prompt augmentation. Smaller than memos, content-
--- addressed by sha256, scored against inbound queries via the /v1/rag
--- endpoint. Populated by the chunk-ingestion workstream (Router's
--- chunk-builder writes here instead of its local pgvector table).
-CREATE TABLE IF NOT EXISTS fabric.chunks (
-  id BIGSERIAL PRIMARY KEY,
-  source_path TEXT NOT NULL,
-  source_range TEXT NOT NULL DEFAULT '',
-  content TEXT NOT NULL,
-  content_sha256 TEXT NOT NULL,
-  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-  tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
-  embedding vector(768),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT chunks_sha256_uniq UNIQUE (content_sha256)
-);
-
-CREATE INDEX IF NOT EXISTS chunks_tsv_idx ON fabric.chunks USING gin (tsv);
-CREATE INDEX IF NOT EXISTS chunks_source_idx ON fabric.chunks (source_path);
-CREATE INDEX IF NOT EXISTS chunks_created_idx ON fabric.chunks (created_at DESC);
-CREATE INDEX IF NOT EXISTS chunks_emb_ivf ON fabric.chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
 `
 
 type server struct {
-	pool       *pgxpool.Pool
-	apiKey     string
-	ollamaURL  string
-	httpClient *http.Client
+	pool           *pgxpool.Pool
+	apiKey         string // legacy FABRIC_KEY (boot-time only; runtime auth via kronaxis_meta.tenant_keys)
+	ollamaURL      string
+	httpClient     *http.Client
+	tenantResolver *tenantResolver
+}
+
+// withTenant wraps a tenant-scoped handler with auth + tenant resolution. The
+// handler is invoked with the resolved *tenantCtx; on failure the error is
+// rendered and the handler is NOT called.
+func (s *server) withTenant(next func(tc *tenantCtx, w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tc, herr := s.tenantResolver.resolveTenant(r)
+		if herr != nil {
+			writeErr(w, herr.Code, herr.Msg)
+			return
+		}
+		next(tc, w, r)
+	}
+}
+
+// withTenantID is like withTenant but extracts a numeric ID suffix from the
+// path (used by /v1/memo/<id> verbs).
+func (s *server) withTenantID(next func(tc *tenantCtx, w http.ResponseWriter, r *http.Request, id int64)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tc, herr := s.tenantResolver.resolveTenant(r)
+		if herr != nil {
+			writeErr(w, herr.Code, herr.Msg)
+			return
+		}
+		idStr := strings.TrimPrefix(r.URL.Path, "/v1/memo/")
+		if idStr == "" {
+			writeErr(w, 404, "memo id required")
+			return
+		}
+		id, err := strconv.ParseInt(idStr, 10, 64)
+		if err != nil {
+			writeErr(w, 400, "bad id")
+			return
+		}
+		next(tc, w, r, id)
+	}
 }
 
 // ---------- types ----------
@@ -187,12 +184,11 @@ type memoCreateReq struct {
 	Content string   `json:"content"`
 	Type    string   `json:"type"`
 	Tags    []string `json:"tags"`
-	// UpsertKey enables supersession semantics. If non-empty, the request
-	// performs an UPSERT against the unique partial index on upsert_key
-	// instead of the default sha256 dedup. Banking "CURRENT STATE 2026-06-06"
-	// with upsert_key="voice_subsystem_state" overwrites the prior memo at
-	// that key in-place (same id, fresh title/content/type/embedding/ts).
-	// Search returns at most one row per key — the freshest one.
+	// UpsertKey enables supersession semantics (B1, memo #1807). If non-empty,
+	// the request performs an UPSERT against the unique partial index on
+	// upsert_key instead of the default sha256 dedup. Banking "CURRENT STATE
+	// 2026-06-06" with upsert_key="voice_subsystem_state" overwrites the prior
+	// memo at that key in-place (same id, fresh title/content/type/embedding/ts).
 	UpsertKey string `json:"upsert_key,omitempty"`
 }
 
@@ -438,9 +434,21 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
+// requireAuth gates fabric writes/reads on the single shared Bearer token.
+//
+// C-3 fix (memo #776): the previous `==` string compare was a timing-leak —
+// an attacker can recover the token byte-by-byte by measuring response time.
+// crypto/subtle.ConstantTimeCompare gives constant-time equality, and we
+// length-pre-check first because ConstantTimeCompare returns 0 if lengths
+// differ (the length comparison itself isn't sensitive: it's the header
+// length, which the attacker already controls).
 func (s *server) requireAuth(r *http.Request) bool {
 	expected := "Bearer " + s.apiKey
-	return r.Header.Get("Authorization") == expected
+	supplied := r.Header.Get("Authorization")
+	if len(supplied) != len(expected) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(supplied), []byte(expected)) == 1
 }
 
 func excerpt(content string, n int) string {
@@ -457,20 +465,33 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if err := s.pool.Ping(r.Context()); err != nil {
 		dbStatus = "err: " + err.Error()[:80]
 	}
+	// Tenant registry health: count active tenants. Failure = "meta not migrated".
+	var activeTenants int64
+	metaStatus := "ok"
+	if err := s.pool.QueryRow(r.Context(),
+		`SELECT count(*) FROM kronaxis_meta.tenants WHERE status='active'`).Scan(&activeTenants); err != nil {
+		metaStatus = "err: " + err.Error()[:80]
+	}
+	var backcompatHits uint64
+	requireHeader := false
+	if s.tenantResolver != nil {
+		backcompatHits = s.tenantResolver.backcompatHits()
+		requireHeader = s.tenantResolver.requireHeader
+	}
 	writeJSON(w, 200, map[string]any{
-		"ok":              dbStatus == "ok",
-		"version":         version,
-		"db":              dbStatus,
-		"embedding_model": embeddingModel,
-		"embedding_dim":   embeddingDim,
+		"ok":                    dbStatus == "ok" && metaStatus == "ok",
+		"version":               version,
+		"db":                    dbStatus,
+		"meta_db":               metaStatus,
+		"active_tenants":        activeTenants,
+		"backcompat_hits":       backcompatHits,
+		"require_tenant_header": requireHeader,
+		"embedding_model":       embeddingModel,
+		"embedding_dim":         embeddingDim,
 	})
 }
 
-func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAuth(r) {
-		writeErr(w, 401, "unauthorised")
-		return
-	}
+func (s *server) handleCreate(tc *tenantCtx, w http.ResponseWriter, r *http.Request) {
 	var req memoCreateReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid json: "+err.Error())
@@ -494,7 +515,7 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if e, err := s.embed(ctx, req.Title+"\n"+req.Content); err == nil {
 		emb = e
 	} else {
-		log.Printf("embed warn (memo): %v", err)
+		log.Printf("embed warn (memo, tenant=%s): %v", tc.SchemaName, err)
 	}
 
 	var id int64
@@ -502,14 +523,13 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var inserted bool
 	var superseded bool
 
-	// Supersession path: ON CONFLICT (upsert_key) DO UPDATE the prior row
-	// in-place with the new title/content/type/tags/embedding/updated_at.
-	// SHA256 dedup is bypassed because the whole point is that the content
-	// has CHANGED (e.g. CURRENT STATE 2026-06-06 vs the May version).
+	// B1 supersession path: ON CONFLICT (upsert_key) DO UPDATE the prior row
+	// in-place. SHA256 dedup is bypassed because the whole point is that the
+	// content has CHANGED (e.g. CURRENT STATE 2026-06-06 vs the May version).
 	if req.UpsertKey != "" {
 		if emb != nil {
-			err := s.pool.QueryRow(ctx, `
-				INSERT INTO fabric.memos (title, content, type, tags, sha256, embedding, upsert_key)
+			err := s.pool.QueryRow(ctx, fmt.Sprintf(`
+				INSERT INTO %s.memos (title, content, type, tags, sha256, embedding, upsert_key)
 				VALUES ($1, $2, $3, $4, $5, $6, $7)
 				ON CONFLICT (upsert_key)
 				  WHERE upsert_key IS NOT NULL AND deleted_at IS NULL
@@ -521,7 +541,7 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 					sha256 = EXCLUDED.sha256,
 					embedding = EXCLUDED.embedding,
 					updated_at = now()
-				RETURNING id, (xmax = 0)`,
+				RETURNING id, (xmax = 0)`, tc.SchemaName),
 				req.Title, req.Content, req.Type, append([]string{}, req.Tags...), hash, pgvector.NewVector(emb), req.UpsertKey,
 			).Scan(&id, &inserted)
 			if err != nil {
@@ -529,8 +549,8 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
-			err := s.pool.QueryRow(ctx, `
-				INSERT INTO fabric.memos (title, content, type, tags, sha256, upsert_key)
+			err := s.pool.QueryRow(ctx, fmt.Sprintf(`
+				INSERT INTO %s.memos (title, content, type, tags, sha256, upsert_key)
 				VALUES ($1, $2, $3, $4, $5, $6)
 				ON CONFLICT (upsert_key)
 				  WHERE upsert_key IS NOT NULL AND deleted_at IS NULL
@@ -541,7 +561,7 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 					tags = EXCLUDED.tags,
 					sha256 = EXCLUDED.sha256,
 					updated_at = now()
-				RETURNING id, (xmax = 0)`,
+				RETURNING id, (xmax = 0)`, tc.SchemaName),
 				req.Title, req.Content, req.Type, append([]string{}, req.Tags...), hash, req.UpsertKey,
 			).Scan(&id, &inserted)
 			if err != nil {
@@ -551,11 +571,11 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		superseded = !inserted
 	} else if emb != nil {
-		err := s.pool.QueryRow(ctx, `
-			INSERT INTO fabric.memos (title, content, type, tags, sha256, embedding)
+		err := s.pool.QueryRow(ctx, fmt.Sprintf(`
+			INSERT INTO %s.memos (title, content, type, tags, sha256, embedding)
 			VALUES ($1, $2, $3, $4, $5, $6)
 			ON CONFLICT (sha256) DO UPDATE SET sha256 = EXCLUDED.sha256
-			RETURNING id, (xmax = 0)`,
+			RETURNING id, (xmax = 0)`, tc.SchemaName),
 			req.Title, req.Content, req.Type, append([]string{}, req.Tags...), hash, pgvector.NewVector(emb),
 		).Scan(&id, &inserted)
 		if err != nil {
@@ -563,11 +583,11 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		err := s.pool.QueryRow(ctx, `
-			INSERT INTO fabric.memos (title, content, type, tags, sha256)
+		err := s.pool.QueryRow(ctx, fmt.Sprintf(`
+			INSERT INTO %s.memos (title, content, type, tags, sha256)
 			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (sha256) DO UPDATE SET sha256 = EXCLUDED.sha256
-			RETURNING id, (xmax = 0)`,
+			RETURNING id, (xmax = 0)`, tc.SchemaName),
 			req.Title, req.Content, req.Type, append([]string{}, req.Tags...), hash,
 		).Scan(&id, &inserted)
 		if err != nil {
@@ -579,11 +599,7 @@ func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, memoCreateResp{ID: id, SHA256: hash, Deduped: deduped, Embedded: emb != nil, Superseded: superseded})
 }
 
-func (s *server) handleUpdate(w http.ResponseWriter, r *http.Request, id int64) {
-	if !s.requireAuth(r) {
-		writeErr(w, 401, "unauthorised")
-		return
-	}
+func (s *server) handleUpdate(tc *tenantCtx, w http.ResponseWriter, r *http.Request, id int64) {
 	var req memoUpdateReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid json")
@@ -595,7 +611,7 @@ func (s *server) handleUpdate(w http.ResponseWriter, r *http.Request, id int64) 
 	// Read existing
 	var title, content, mtype string
 	var tags []string
-	err := s.pool.QueryRow(ctx, `SELECT title, content, type, tags FROM fabric.memos WHERE id=$1 AND deleted_at IS NULL`, id).Scan(&title, &content, &mtype, &tags)
+	err := s.pool.QueryRow(ctx, fmt.Sprintf(`SELECT title, content, type, tags FROM %s.memos WHERE id=$1 AND deleted_at IS NULL`, tc.SchemaName), id).Scan(&title, &content, &mtype, &tags)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeErr(w, 404, "not found")
@@ -623,10 +639,10 @@ func (s *server) handleUpdate(w http.ResponseWriter, r *http.Request, id int64) 
 		emb = e
 	}
 	if emb != nil {
-		_, err = s.pool.Exec(ctx, `UPDATE fabric.memos SET title=$1, content=$2, type=$3, tags=$4, sha256=$5, embedding=$6, updated_at=now() WHERE id=$7`,
+		_, err = s.pool.Exec(ctx, fmt.Sprintf(`UPDATE %s.memos SET title=$1, content=$2, type=$3, tags=$4, sha256=$5, embedding=$6, updated_at=now() WHERE id=$7`, tc.SchemaName),
 			title, content, mtype, tags, hash, pgvector.NewVector(emb), id)
 	} else {
-		_, err = s.pool.Exec(ctx, `UPDATE fabric.memos SET title=$1, content=$2, type=$3, tags=$4, sha256=$5, updated_at=now() WHERE id=$6`,
+		_, err = s.pool.Exec(ctx, fmt.Sprintf(`UPDATE %s.memos SET title=$1, content=$2, type=$3, tags=$4, sha256=$5, updated_at=now() WHERE id=$6`, tc.SchemaName),
 			title, content, mtype, tags, hash, id)
 	}
 	if err != nil {
@@ -636,14 +652,10 @@ func (s *server) handleUpdate(w http.ResponseWriter, r *http.Request, id int64) 
 	writeJSON(w, 200, map[string]any{"id": id, "sha256": hash, "embedded": emb != nil})
 }
 
-func (s *server) handleDelete(w http.ResponseWriter, r *http.Request, id int64) {
-	if !s.requireAuth(r) {
-		writeErr(w, 401, "unauthorised")
-		return
-	}
+func (s *server) handleDelete(tc *tenantCtx, w http.ResponseWriter, r *http.Request, id int64) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	tag, err := s.pool.Exec(ctx, `UPDATE fabric.memos SET deleted_at=now() WHERE id=$1 AND deleted_at IS NULL`, id)
+	tag, err := s.pool.Exec(ctx, fmt.Sprintf(`UPDATE %s.memos SET deleted_at=now() WHERE id=$1 AND deleted_at IS NULL`, tc.SchemaName), id)
 	if err != nil {
 		writeErr(w, 500, "db: "+err.Error())
 		return
@@ -655,17 +667,13 @@ func (s *server) handleDelete(w http.ResponseWriter, r *http.Request, id int64) 
 	writeJSON(w, 200, map[string]any{"id": id, "deleted": true})
 }
 
-func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id int64) {
-	if !s.requireAuth(r) {
-		writeErr(w, 401, "unauthorised")
-		return
-	}
+func (s *server) handleGet(tc *tenantCtx, w http.ResponseWriter, r *http.Request, id int64) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	var title, content, mtype string
 	var tags []string
 	var createdAt, updatedAt time.Time
-	err := s.pool.QueryRow(ctx, `SELECT title, content, type, tags, created_at, updated_at FROM fabric.memos WHERE id=$1 AND deleted_at IS NULL`, id).Scan(&title, &content, &mtype, &tags, &createdAt, &updatedAt)
+	err := s.pool.QueryRow(ctx, fmt.Sprintf(`SELECT title, content, type, tags, created_at, updated_at FROM %s.memos WHERE id=$1 AND deleted_at IS NULL`, tc.SchemaName), id).Scan(&title, &content, &mtype, &tags, &createdAt, &updatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			writeErr(w, 404, "not found")
@@ -680,11 +688,9 @@ func (s *server) handleGet(w http.ResponseWriter, r *http.Request, id int64) {
 	})
 }
 
-func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAuth(r) {
-		writeErr(w, 401, "unauthorised")
-		return
-	}
+// handleSearch — tenant-scoped memo search. Delegates to searchInSchema so
+// the same logic is reusable by handleAdminCrossTenantSearch.
+func (s *server) handleSearch(tc *tenantCtx, w http.ResponseWriter, r *http.Request) {
 	var req searchReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, "invalid json")
@@ -700,50 +706,64 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if req.Mode == "" {
 		req.Mode = "hybrid"
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	hits, err := s.searchInSchema(r.Context(), tc, req.Query, req.Type, req.Mode, req.TopK, false)
+	if err != nil {
+		writeErr(w, 500, "db: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"results": hits, "mode": req.Mode, "tenant": tc.DisplayAlias})
+}
+
+// searchInSchema runs the three-mode search against a tenant's memos table.
+// The schema name comes from `tc.SchemaName` which is already validated.
+// `_ = rerank` is unused on this branch (no mxbai wired); the param keeps the
+// signature stable for handleAdminCrossTenantSearch callers.
+func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeFilter, mode string, topK int, _ bool) ([]searchHit, error) {
+	if mode == "" {
+		mode = "hybrid"
+	}
+	sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	// Compute query embedding for semantic + hybrid modes
 	var qEmb []float32
-	if req.Mode == "semantic" || req.Mode == "hybrid" {
-		if e, err := s.embed(ctx, req.Query); err == nil {
+	if mode == "semantic" || mode == "hybrid" {
+		if e, err := s.embed(sctx, query); err == nil {
 			qEmb = e
 		} else {
-			log.Printf("embed warn (search): %v", err)
-			// fall back to tsvector if embedding fails
-			req.Mode = "tsvector"
+			log.Printf("embed warn (search, tenant=%s): %v", tc.SchemaName, err)
+			mode = "tsvector"
 		}
 	}
 
 	var rows pgx.Rows
 	var err error
-	switch req.Mode {
+	switch mode {
 	case "tsvector":
-		rows, err = s.pool.Query(ctx, `
+		rows, err = s.pool.Query(sctx, fmt.Sprintf(`
 			SELECT id, title, content,
 			       ts_rank(tsv, plainto_tsquery('english', $1)) * 0.7
 			       + (1.0 / (1 + EXTRACT(EPOCH FROM (now()-created_at))/86400.0/30)) * 0.3 AS score,
 			       type, created_at
-			FROM fabric.memos
+			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND tsv @@ plainto_tsquery('english', $1)
 			  AND ($2 = '' OR type = $2)
-			ORDER BY score DESC LIMIT $3`,
-			req.Query, req.Type, req.TopK)
+			ORDER BY score DESC LIMIT $3`, tc.SchemaName),
+			query, typeFilter, topK)
 	case "semantic":
-		rows, err = s.pool.Query(ctx, `
+		rows, err = s.pool.Query(sctx, fmt.Sprintf(`
 			SELECT id, title, content,
 			       (1.0 - (embedding <=> $1)) * 0.8
 			       + (1.0 / (1 + EXTRACT(EPOCH FROM (now()-created_at))/86400.0/30)) * 0.2 AS score,
 			       type, created_at
-			FROM fabric.memos
+			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND embedding IS NOT NULL
 			  AND ($2 = '' OR type = $2)
-			ORDER BY embedding <=> $1 ASC LIMIT $3`,
-			pgvector.NewVector(qEmb), req.Type, req.TopK)
+			ORDER BY embedding <=> $1 ASC LIMIT $3`, tc.SchemaName),
+			pgvector.NewVector(qEmb), typeFilter, topK)
 	default: // hybrid
-		rows, err = s.pool.Query(ctx, `
+		rows, err = s.pool.Query(sctx, fmt.Sprintf(`
 			SELECT id, title, content,
 			       CASE WHEN embedding IS NULL THEN
 			           ts_rank(tsv, plainto_tsquery('english', $2)) * 0.7
@@ -754,23 +774,21 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			           + (1.0 / (1 + EXTRACT(EPOCH FROM (now()-created_at))/86400.0/30)) * 0.2
 			       END AS score,
 			       type, created_at
-			FROM fabric.memos
+			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND ($3 = '' OR type = $3)
 			  AND (
 			      embedding IS NOT NULL
 			      OR tsv @@ plainto_tsquery('english', $2)
 			  )
-			ORDER BY score DESC LIMIT $4`,
-			pgvector.NewVector(qEmb), req.Query, req.Type, req.TopK)
+			ORDER BY score DESC LIMIT $4`, tc.SchemaName),
+			pgvector.NewVector(qEmb), query, typeFilter, topK)
 	}
 	if err != nil {
-		writeErr(w, 500, "db: "+err.Error())
-		return
+		return nil, err
 	}
 	defer rows.Close()
-
-	results := []searchHit{}
+	hits := []searchHit{}
 	for rows.Next() {
 		var h searchHit
 		var content string
@@ -778,9 +796,9 @@ func (s *server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.Excerpt = excerpt(content, 200)
-		results = append(results, h)
+		hits = append(hits, h)
 	}
-	writeJSON(w, 200, map[string]any{"results": results, "mode": req.Mode})
+	return hits, nil
 }
 
 // ---------- coord endpoints ----------
@@ -865,15 +883,11 @@ func (s *server) handleCoordRecent(w http.ResponseWriter, r *http.Request) {
 
 // ---------- backfill ----------
 
-func (s *server) handleBackfillEmbeddings(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAuth(r) {
-		writeErr(w, 401, "unauthorised")
-		return
-	}
+func (s *server) handleBackfillEmbeddings(tc *tenantCtx, w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
 	defer cancel()
 
-	rows, err := s.pool.Query(ctx, `SELECT id, title, content FROM fabric.memos WHERE embedding IS NULL AND deleted_at IS NULL ORDER BY id`)
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`SELECT id, title, content FROM %s.memos WHERE embedding IS NULL AND deleted_at IS NULL ORDER BY id`, tc.SchemaName))
 	if err != nil {
 		writeErr(w, 500, "db: "+err.Error())
 		return
@@ -902,7 +916,7 @@ func (s *server) handleBackfillEmbeddings(w http.ResponseWriter, r *http.Request
 			stats["fail"]++
 			continue
 		}
-		if _, err := s.pool.Exec(ctx, `UPDATE fabric.memos SET embedding=$1 WHERE id=$2`, pgvector.NewVector(emb), t.ID); err != nil {
+		if _, err := s.pool.Exec(ctx, fmt.Sprintf(`UPDATE %s.memos SET embedding=$1 WHERE id=$2`, tc.SchemaName), pgvector.NewVector(emb), t.ID); err != nil {
 			stats["fail"]++
 			continue
 		}
@@ -1891,27 +1905,19 @@ func (s *server) pullFromPeer(ctx context.Context, peerID, peerURL, token string
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", s.handleHealth)
-	mux.HandleFunc("/v1/memo/search", s.handleSearch)
-	mux.HandleFunc("/v1/memo/backfill", s.handleBackfillEmbeddings)
+
+	// ---------- tenant-scoped memo routes ----------
+	mux.HandleFunc("/v1/memo/search", s.withTenant(s.handleSearch))
+	mux.HandleFunc("/v1/memo/backfill", s.withTenant(s.handleBackfillEmbeddings))
 	mux.HandleFunc("/v1/memo/", func(w http.ResponseWriter, r *http.Request) {
-		// /v1/memo/:id with GET/PUT/DELETE
-		idStr := strings.TrimPrefix(r.URL.Path, "/v1/memo/")
-		if idStr == "" {
-			writeErr(w, 404, "memo id required")
-			return
-		}
-		id, err := strconv.ParseInt(idStr, 10, 64)
-		if err != nil {
-			writeErr(w, 400, "bad id")
-			return
-		}
+		// /v1/memo/:id with GET/PUT/DELETE — resolved via withTenantID.
 		switch r.Method {
 		case "GET":
-			s.handleGet(w, r, id)
+			s.withTenantID(s.handleGet)(w, r)
 		case "PUT":
-			s.handleUpdate(w, r, id)
+			s.withTenantID(s.handleUpdate)(w, r)
 		case "DELETE":
-			s.handleDelete(w, r, id)
+			s.withTenantID(s.handleDelete)(w, r)
 		default:
 			writeErr(w, 405, "method not allowed")
 		}
@@ -1921,8 +1927,45 @@ func (s *server) routes() http.Handler {
 			writeErr(w, 405, "POST only")
 			return
 		}
-		s.handleCreate(w, r)
+		s.withTenant(s.handleCreate)(w, r)
 	})
+
+	// ---------- multi-tenant ops (admin-scope) ----------
+	mux.HandleFunc("/v1/tenant", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			writeErr(w, 405, "POST only")
+			return
+		}
+		s.withTenant(s.handleTenantCreate)(w, r)
+	})
+	mux.HandleFunc("/v1/tenants", s.withTenant(s.handleTenantList))
+	mux.HandleFunc("/v1/tenant/", func(w http.ResponseWriter, r *http.Request) {
+		id, sub, ok := parseTenantIDFromPath(r.URL.Path)
+		if !ok {
+			writeErr(w, 404, "tenant id required")
+			return
+		}
+		switch {
+		case sub == "" && r.Method == "GET":
+			s.withTenant(func(tc *tenantCtx, w http.ResponseWriter, r *http.Request) { s.handleTenantGet(tc, w, r, id) })(w, r)
+		case sub == "" && r.Method == "DELETE":
+			s.withTenant(func(tc *tenantCtx, w http.ResponseWriter, r *http.Request) { s.handleTenantSoftDelete(tc, w, r, id) })(w, r)
+		case sub == "rotate-key" && r.Method == "POST":
+			s.withTenant(func(tc *tenantCtx, w http.ResponseWriter, r *http.Request) { s.handleTenantRotateKey(tc, w, r, id) })(w, r)
+		case sub == "purge" && r.Method == "POST":
+			s.withTenant(func(tc *tenantCtx, w http.ResponseWriter, r *http.Request) { s.handleTenantPurge(tc, w, r, id) })(w, r)
+		default:
+			writeErr(w, 404, "unknown tenant sub-route")
+		}
+	})
+	mux.HandleFunc("/v1/admin/cross-tenant-search", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			writeErr(w, 405, "POST only")
+			return
+		}
+		s.withTenant(s.handleAdminCrossTenantSearch)(w, r)
+	})
+
 	mux.HandleFunc("/v1/coord", s.handleCoordSend)
 	mux.HandleFunc("/v1/coord/recent", s.handleCoordRecent)
 
@@ -2053,22 +2096,6 @@ func (s *server) routes() http.Handler {
 	})
 	mux.HandleFunc("/v1/router/recommend", s.handleRouterRecommend)
 
-	// ---------- v0.10 RAG (Router <-> Fabric integration) ----------
-	mux.HandleFunc("/v1/rag", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			writeErr(w, 405, "POST only")
-			return
-		}
-		s.handleRAG(w, r)
-	})
-	mux.HandleFunc("/v1/chunks", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			writeErr(w, 405, "POST only")
-			return
-		}
-		s.handleChunkUpsert(w, r)
-	})
-
 	return mux
 }
 
@@ -2103,6 +2130,8 @@ func main() {
 		log.Fatalf("schema apply failed: %v", err)
 	}
 
+	requireHeader := strings.EqualFold(os.Getenv("FABRIC_REQUIRE_TENANT_HEADER"), "true")
+
 	s := &server{
 		pool:      pool,
 		apiKey:    apiKey,
@@ -2111,6 +2140,13 @@ func main() {
 			Timeout: 30 * time.Second,
 		},
 	}
+	s.tenantResolver = &tenantResolver{
+		pool:             pool,
+		tenantZeroID:     tenantZeroID,
+		tenantZeroSchema: tenantZeroSchema,
+		requireHeader:    requireHeader,
+		cacheTTL:         60 * time.Second,
+	}
 
 	// Background workers — cancelled on process exit.
 	bgCtx, bgCancel := context.WithCancel(context.Background())
@@ -2118,7 +2154,8 @@ func main() {
 	go s.sessionsReaper(bgCtx)
 	go s.federationPoller(bgCtx)
 
-	log.Printf("fabric v%s listening on %s (ollama=%s, model=%s, dim=%d)", version, listen, s.ollamaURL, embeddingModel, embeddingDim)
+	log.Printf("fabric v%s listening on %s (ollama=%s, model=%s, dim=%d, require_tenant_header=%v)",
+		version, listen, s.ollamaURL, embeddingModel, embeddingDim, requireHeader)
 	if err := http.ListenAndServe(listen, s.routes()); err != nil {
 		log.Fatal(err)
 	}
