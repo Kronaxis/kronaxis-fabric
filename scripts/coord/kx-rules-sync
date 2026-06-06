@@ -1,0 +1,44 @@
+#!/bin/bash
+# sync_golden_rules_to_fabric.sh — one-way sync of GOLDEN_RULES.md into fabric.
+#
+# Per the rulesfab design: GOLDEN_RULES.md remains the human-authored canonical
+# source. Fabric is the distribution layer for sessions. This script re-ingests
+# the canonical file into fabric whenever the operator edits it.
+#
+# Convention: operator edits the LAPTOP's
+# /home/jason/projects/kronaxis/GOLDEN_RULES.md, then runs this script
+# (or it's wired into a git pre-push hook).
+#
+# Reversibility: tags every memo with version:2026-06-06-46rules. To bump,
+# update the version tag in ingest_rules.py and re-run with --purge.
+#
+# Status: Phase 2 SHIPPED 2026-06-06 (rulesfab session, fabric ACK coord #997).
+# Deployed to ~/bin/ alongside kx-rules-ingest.py.
+
+set -euo pipefail
+
+SRC="/home/jason/projects/kronaxis/GOLDEN_RULES.md"
+INGEST_SCRIPT="/home/jason/bin/kx-rules-ingest.py"
+
+if [ ! -f "$SRC" ]; then
+  echo "FATAL: canonical source $SRC missing" >&2
+  exit 1
+fi
+
+if [ ! -x "$INGEST_SCRIPT" ] && [ ! -f "$INGEST_SCRIPT" ]; then
+  echo "FATAL: ingest script $INGEST_SCRIPT missing" >&2
+  exit 1
+fi
+
+ACTUAL_MD5="$(md5sum "$SRC" | awk '{print $1}')"
+EXPECTED_MD5="37466dce940f14c6dfe96190ae13a0a5"
+
+if [ "$ACTUAL_MD5" != "$EXPECTED_MD5" ]; then
+  echo "[sync] WARN: $SRC md5=$ACTUAL_MD5 differs from snapshot $EXPECTED_MD5"
+  echo "[sync] If the operator edited the rules, update EXPECTED_MD5 in ingest_rules.py to the new hash and re-run."
+  echo "[sync] If this is the laptop and the hash is unchanged, run this script from the laptop instead."
+  exit 2
+fi
+
+# Re-ingest with --purge so any drift in tags or topics is reset.
+python3 "$INGEST_SCRIPT" --purge

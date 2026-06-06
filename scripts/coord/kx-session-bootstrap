@@ -86,6 +86,74 @@ except Exception as e:
     print(f'  (memo parse error: {e})')
 "
 
+# 5.5) PRINT GOLDEN RULES into session context. Hard-floor (always) + topic match.
+# Source: tenant_00000000.memos rows tagged version:2026-06-06-46rules.
+# Hard-floor: tag 'hard-floor' (always print).
+# Topic match: any topic:<x> tag where session-name shares a substring with <x>.
+# Falls back silently if psql/PG creds are absent — the slim CLAUDE.md carries the
+# hard floor inline as a fabric-down belt-and-braces.
+KX_PG_HOST="${KX_PG_HOST:-192.168.50.129}"
+KX_PG_USER="${KX_PG_USER:-titan}"
+KX_PG_DB="${KX_PG_DB:-tfs}"
+KX_PG_PASS="${KX_PG_PASS:-${TFS_DB_PASSWORD:-sovereign_hardened_2026}}"
+RULES_VERSION_TAG="version:2026-06-06-46rules"
+LOW_SESSION="$(echo "$SESSION" | tr '[:upper:]' '[:lower:]')"
+
+if command -v psql >/dev/null 2>&1; then
+  # Use string_agg with sentinel separator so multi-line `content` round-trips cleanly.
+  RULE_SEP=$'\n\n----------------------------------------------------------------\n\n'
+  HARDFLOOR_TEXT="$(PGPASSWORD="$KX_PG_PASS" psql -h "$KX_PG_HOST" -U "$KX_PG_USER" -d "$KX_PG_DB" -t -A -c "
+    WITH rules AS (
+      SELECT (regexp_replace(title, '^Golden Rule (\d+).*', '\1'))::int AS rnum, content
+      FROM tenant_00000000.memos
+      WHERE '${RULES_VERSION_TAG}' = ANY(tags)
+        AND 'hard-floor' = ANY(tags)
+        AND title LIKE 'Golden Rule %'
+    )
+    SELECT string_agg(content, E'\n\n----------------------------------------------------------------\n\n' ORDER BY rnum)
+    FROM rules;
+  " 2>/dev/null || echo "")"
+
+  TOPIC_TEXT="$(PGPASSWORD="$KX_PG_PASS" psql -h "$KX_PG_HOST" -U "$KX_PG_USER" -d "$KX_PG_DB" -t -A -c "
+    WITH rules AS (
+      SELECT (regexp_replace(title, '^Golden Rule (\d+).*', '\1'))::int AS rnum, content
+      FROM tenant_00000000.memos
+      WHERE '${RULES_VERSION_TAG}' = ANY(tags)
+        AND NOT ('hard-floor' = ANY(tags))
+        AND title LIKE 'Golden Rule %'
+        AND EXISTS (
+          SELECT 1 FROM unnest(tags) AS t
+          WHERE t LIKE 'topic:%'
+            AND position(substring(t from 7) in '${LOW_SESSION}') > 0
+        )
+    )
+    SELECT string_agg(content, E'\n\n----------------------------------------------------------------\n\n' ORDER BY rnum)
+    FROM rules;
+  " 2>/dev/null || echo "")"
+
+  if [ -n "$HARDFLOOR_TEXT" ]; then
+    echo ""
+    echo "================================================================"
+    echo "GOLDEN RULES — HARD FLOOR (always in context, fabric ${RULES_VERSION_TAG})"
+    echo "================================================================"
+    echo "$HARDFLOOR_TEXT"
+  else
+    echo "[bootstrap] WARN: could not load hard-floor rules from fabric DB"
+  fi
+
+  if [ -n "$TOPIC_TEXT" ]; then
+    echo ""
+    echo "================================================================"
+    echo "GOLDEN RULES — TOPIC MATCH for session '$SESSION'"
+    echo "================================================================"
+    echo "$TOPIC_TEXT"
+  else
+    echo "[bootstrap] no topic-rule matches for session '$SESSION' (hard-floor still applied)"
+  fi
+else
+  echo "[bootstrap] WARN: psql not available — relying on CLAUDE.md inline hard-floor"
+fi
+
 # 6) Show any unread coord backlog directed at us.
 BACKLOG=$(~/bin/kx-coord-pending --recipient "$SESSION" --no-update 2>/dev/null || echo "")
 if [ -n "$BACKLOG" ]; then
