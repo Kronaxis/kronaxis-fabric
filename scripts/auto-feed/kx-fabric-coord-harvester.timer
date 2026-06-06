@@ -1,0 +1,11 @@
+[Unit]
+Description=Kronaxis Fabric — coord_messages hourly harvester (B4) — :07 each hour
+Requires=kx-fabric-coord-harvester.service
+
+[Timer]
+OnCalendar=*-*-* *:07:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Kronaxis Fabric — 4-hourly runtime snapshot (B5)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/kx-fabric-runtime-snapshot
+EnvironmentFile=-%h/.config/kx-fabric-daily-digest.env
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,11 @@
+[Unit]
+Description=Kronaxis Fabric — daily ground-truth digest (B2) — runs at 03:00 + catches up on boot
+Requires=kx-fabric-daily-digest.service
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

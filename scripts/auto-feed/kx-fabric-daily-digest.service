@@ -1,0 +1,12 @@
+[Unit]
+Description=Kronaxis Fabric — daily ground-truth digest (B2)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/kx-fabric-daily-digest
+# Per-host overrides (FABRIC_URL, FABRIC_KEY, PGPASSWORD, REPOS).
+# Optional — falls back to script defaults if absent.
+EnvironmentFile=-%h/.config/kx-fabric-daily-digest.env
+StandardOutput=journal
+StandardError=journal

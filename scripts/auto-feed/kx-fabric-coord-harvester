@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""
+kx-fabric-coord-harvester — B4
+
+Hourly sweep of public.coord_messages. For every (sender, day) with new
+traffic, build a single rolled-up memo and POST it to fabric with
+upsert_key=coord_<sender>_<day>. Once B1 binary lands the day's memo
+gets overwritten in place every hour as more messages arrive; today
+(pre-B1-binary) sha256 dedup means each fresh hour creates a new row
+because the content differs — acceptable noise that collapses once the
+binary supports upsert_key.
+
+Scope: messages with ts >= now() - 25h. Covers the rolling-day window
+so a hour-of-day-boundary doesn't drop yesterday's tail.
+
+Output per (sender, day) memo:
+  title: "COORD <sender> <YYYY-MM-DD>"
+  type:  "project"
+  key:   "coord_<sender>_<YYYY-MM-DD>"
+  body:  markdown table of {ts, recipient, subject, body-first-line}
+
+Env (all optional):
+  FABRIC_URL    default http://192.168.50.129:8201
+  FABRIC_KEY    default test-key-1 (else $HOME/.fabric-key)
+  TENANT_HEADER default 00000000-0000-7000-8000-000000000000
+  PG_HOST       default 192.168.50.129
+  PG_USER       default titan
+  PG_DB         default tfs
+  PGPASSWORD    required
+"""
+import json
+import os
+import pathlib
+import sys
+from collections import defaultdict
+from datetime import datetime, timezone
+
+try:
+    import psycopg2
+except ImportError:
+    sys.stderr.write(
+        "psycopg2 not available — apt install python3-psycopg2 "
+        "or pip install psycopg2-binary\n"
+    )
+    sys.exit(1)
+
+import urllib.request
+
+
+FABRIC_URL = os.environ.get("FABRIC_URL", "http://192.168.50.129:8201")
+TENANT = os.environ.get(
+    "TENANT_HEADER", "00000000-0000-7000-8000-000000000000"
+)
+PG_HOST = os.environ.get("PG_HOST", "192.168.50.129")
+PG_USER = os.environ.get("PG_USER", "titan")
+PG_DB = os.environ.get("PG_DB", "tfs")
+
+
+def fabric_key() -> str:
+    k = os.environ.get("FABRIC_KEY")
+    if k:
+        return k
+    try:
+        return (pathlib.Path.home() / ".fabric-key").read_text().strip()
+    except Exception:
+        return "test-key-1"
+
+
+def fetch_messages():
+    conn = psycopg2.connect(
+        host=PG_HOST,
+        user=PG_USER,
+        dbname=PG_DB,
+        password=os.environ.get("PGPASSWORD", ""),
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ts, sender, recipient, subject, body, host
+                FROM public.coord_messages
+                WHERE ts > now() - interval '25 hours'
+                ORDER BY ts ASC
+                """
+            )
+            yield from cur.fetchall()
+    finally:
+        conn.close()
+
+
+def build_memo(sender: str, day: str, rows: list) -> tuple[str, str, str]:
+    lines = [
+        f"# COORD {sender} — {day}",
+        "",
+        f"Harvested {datetime.now(timezone.utc).isoformat()} by "
+        "kx-fabric-coord-harvester.",
+        f"upsert_key=coord_{sender}_{day}. Rolled up hourly; B1 "
+        "supersession will collapse to one row once binary lands.",
+        "",
+        f"## {len(rows)} message(s)",
+        "",
+    ]
+    for ts, _sender, recipient, subject, body, host in rows:
+        # Sanitise body to a one-line excerpt so the table stays scannable.
+        body_excerpt = (body or "").splitlines()[0][:200].strip()
+        lines.append(
+            f"### {ts.isoformat()} → {recipient} ({host})"
+        )
+        lines.append(f"**subject:** {subject}")
+        if body_excerpt:
+            lines.append(f"**body:** {body_excerpt}")
+        if body and len(body) > 200:
+            lines.append(f"_(body truncated; original {len(body)} chars)_")
+        lines.append("")
+    content = "\n".join(lines)
+    title = f"COORD {sender} {day}"
+    key = f"coord_{sender}_{day}"
+    return title, content, key
+
+
+def post_memo(title: str, content: str, key: str, tags: list) -> dict:
+    req = urllib.request.Request(
+        f"{FABRIC_URL}/v1/memo",
+        method="POST",
+        data=json.dumps(
+            {
+                "title": title,
+                "content": content,
+                "type": "project",
+                "upsert_key": key,
+                "tags": tags,
+            }
+        ).encode(),
+        headers={
+            "Authorization": f"Bearer {fabric_key()}",
+            "X-Tenant-ID": TENANT,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def main() -> int:
+    # group by (sender, day)
+    groups: dict = defaultdict(list)
+    for row in fetch_messages():
+        ts = row[0]
+        sender = row[1]
+        day = ts.astimezone(timezone.utc).date().isoformat()
+        groups[(sender, day)].append(row)
+
+    if not groups:
+        print("no coord traffic in last 25h — nothing to harvest")
+        return 0
+
+    banked = []
+    for (sender, day), rows in sorted(groups.items()):
+        # Skip senders we don't want banked (very noisy / system-internal).
+        if sender in ("ratchet-bot", "echo-test"):
+            continue
+        title, content, key = build_memo(sender, day, rows)
+        resp = post_memo(
+            title,
+            content,
+            key,
+            ["coord_harvest", "auto", f"sender:{sender}"],
+        )
+        banked.append((sender, day, len(rows), resp))
+        print(f"{day} {sender}: {len(rows)} msgs → {resp}")
+    print(f"banked {len(banked)} (sender, day) digests")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

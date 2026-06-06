@@ -1,0 +1,10 @@
+[Unit]
+Description=Kronaxis Fabric — coord_messages hourly harvester (B4)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/kx-fabric-coord-harvester
+EnvironmentFile=-%h/.config/kx-fabric-daily-digest.env
+StandardOutput=journal
+StandardError=journal

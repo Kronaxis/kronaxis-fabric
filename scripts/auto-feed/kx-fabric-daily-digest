@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# kx-fabric-daily-digest
+#
+# Nightly ground-truth digest. Pulls reality out of: git log (last 24h),
+# active systemd user+system services, listening TCP/UDP ports, WireGuard
+# peers, GPU memory, recent coord_messages activity. Banks ONE memo per
+# day to fabric with upsert_key=daily_digest_YYYY-MM-DD so re-running on
+# the same day overwrites in place (B1 supersession primitive).
+#
+# Why: fabric grew stale because sessions failed to bank. Cron banks
+# ground truth unconditionally — no behavioural discipline required.
+#
+# Runs under a systemd timer (kx-fabric-daily-digest.timer) once daily
+# at 03:00 local. Idempotent within a calendar day via upsert_key.
+#
+# Env (any can be overridden):
+#   FABRIC_URL     default http://127.0.0.1:8201
+#   FABRIC_KEY     bearer token; default reads from ~/.fabric-key
+#   REPOS          space-separated list of repo paths to git-log. Defaults
+#                  to the kronaxis ecosystem.
+#   TENANT_HEADER  X-Tenant-ID value. Default: 00000000-0000-7000-8000-000000000000
+#                  (the kronaxis_claude_session platform tenant)
+
+# NB: not set -e — many subcommands legitimately return non-zero on a
+# clean host (grep with no match, wg without sudo, fabric down briefly).
+# We capture explicit failures inline.
+set -uo pipefail
+
+FABRIC_URL="${FABRIC_URL:-http://127.0.0.1:8201}"
+FABRIC_KEY="${FABRIC_KEY:-$(cat "$HOME/.fabric-key" 2>/dev/null || echo test-key-1)}"
+TENANT_HEADER="${TENANT_HEADER:-00000000-0000-7000-8000-000000000000}"
+
+DATE="$(date -I)"
+HOSTNAME_SHORT="$(hostname -s)"
+KEY="daily_digest_${HOSTNAME_SHORT}_${DATE}"
+TITLE="DAILY DIGEST ${HOSTNAME_SHORT} ${DATE}"
+
+REPOS="${REPOS:-/home/jason/projects/kronaxis /home/jason/projects/kronaxis/kronaxis-fabric /home/jason/projects/kronaxis/behavioural-os /home/jason/projects/kronaxis/voice-agent-rtp /home/jason/projects/kronaxis/titan-forge-suite}"
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+# ---------- 1. git activity (last 24h) ----------
+{
+  echo "## git activity (last 24h)"
+  echo ""
+  for repo in $REPOS; do
+    [ -d "$repo/.git" ] || continue
+    label="${repo##*/}"
+    count="$(git -C "$repo" log --since='24 hours ago' --oneline 2>/dev/null | wc -l)"
+    echo "### ${label} (${count} commits)"
+    if [ "$count" -gt 0 ]; then
+      git -C "$repo" log --since='24 hours ago' --pretty='- %h %s (%an, %ar)' 2>/dev/null | head -50
+    fi
+    echo ""
+  done
+} > "$tmp/git.md"
+
+# ---------- 2. systemd active services ----------
+{
+  echo "## systemd active (user)"
+  systemctl --user list-units --type=service --state=active --no-legend --no-pager 2>/dev/null \
+    | awk '{printf "- %s\n", $1}' | head -40
+  echo ""
+  echo "## systemd active (system, kronaxis-relevant)"
+  systemctl --system list-units --type=service --state=active --no-legend --no-pager 2>/dev/null \
+    | grep -iE 'fabric|kronaxis|vllm|voice|whisper|piper|glm|ollama|vanguard|router|tts|stt|gst' \
+    | awk '{printf "- %s\n", $1}' | head -40
+} > "$tmp/systemd.md"
+
+# ---------- 3. listening ports (filtered) ----------
+{
+  echo "## listening ports"
+  ss -tulnp 2>/dev/null | awk 'NR==1 || $5 ~ /:(80|443|2[0-9]{3}|3[0-9]{3}|4[0-9]{3}|5[0-9]{3}|6[0-9]{3}|7[0-9]{3}|8[0-9]{3}|9[0-9]{3}|10[0-9]{3}|11[0-9]{3})/' | head -50
+} > "$tmp/ports.md"
+
+# ---------- 4. wireguard peers ----------
+{
+  echo "## wireguard"
+  if command -v wg >/dev/null 2>&1; then
+    sudo -n wg show 2>/dev/null | head -60 || echo "(wg requires sudo without password — skipped)"
+  else
+    echo "(wg not installed)"
+  fi
+} > "$tmp/wg.md"
+
+# ---------- 5. GPU memory ----------
+{
+  echo "## GPU"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader 2>/dev/null
+  else
+    echo "(no nvidia-smi)"
+  fi
+} > "$tmp/gpu.md"
+
+# ---------- 6. fabric memo count ----------
+{
+  echo "## fabric"
+  curl -fsS "${FABRIC_URL}/v1/health" 2>/dev/null \
+    || echo "(fabric unreachable at ${FABRIC_URL})"
+} > "$tmp/fabric.md"
+
+# ---------- 7. coord activity (last 24h, by sender) ----------
+{
+  echo "## coord activity (last 24h)"
+  if [ -n "${PGPASSWORD:-}" ] || [ -f "$HOME/.pgpass" ]; then
+    PGPASSWORD="${PGPASSWORD:-sovereign_hardened_2026}" psql -h 192.168.50.129 -U titan -d tfs -t -A -c "
+      SELECT sender || ' (' || count(*) || ')'
+      FROM public.coord_messages
+      WHERE ts > now() - interval '24 hours'
+      GROUP BY sender
+      ORDER BY count(*) DESC
+      LIMIT 25
+    " 2>/dev/null | sed 's/^/- /' || echo "(coord query failed)"
+  else
+    echo "(no PG creds — skipped)"
+  fi
+} > "$tmp/coord.md"
+
+# ---------- assemble final markdown ----------
+{
+  echo "# Daily Digest — ${HOSTNAME_SHORT} — ${DATE}"
+  echo ""
+  echo "Generated $(date -u +'%Y-%m-%dT%H:%M:%SZ') by kx-fabric-daily-digest."
+  echo "upsert_key=${KEY}. Banks once per host per day; supersession via B1."
+  echo ""
+  cat "$tmp/git.md"
+  cat "$tmp/systemd.md"
+  cat "$tmp/ports.md"
+  cat "$tmp/wg.md"
+  cat "$tmp/gpu.md"
+  cat "$tmp/fabric.md"
+  cat "$tmp/coord.md"
+} > "$tmp/digest.md"
+
+# ---------- POST to fabric ----------
+# jq -Rs encodes the markdown verbatim as a JSON string.
+payload="$(jq -n \
+  --arg title "$TITLE" \
+  --rawfile content "$tmp/digest.md" \
+  --arg type "project" \
+  --arg key "$KEY" \
+  '{title:$title, content:$content, type:$type, upsert_key:$key, tags:["daily_digest","auto","ground_truth"]}' )"
+
+resp="$(curl -fsS -X POST "${FABRIC_URL}/v1/memo" \
+  -H "Authorization: Bearer ${FABRIC_KEY}" \
+  -H "X-Tenant-ID: ${TENANT_HEADER}" \
+  -H "Content-Type: application/json" \
+  --data "$payload" 2>&1)"
+
+echo "${DATE} ${HOSTNAME_SHORT} digest banked: ${resp}"

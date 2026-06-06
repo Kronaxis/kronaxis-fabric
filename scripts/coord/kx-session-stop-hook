@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""
+kx-session-stop-hook — Claude Code `Stop` hook (B3)
+
+Refuses to end a *material* session until a structured session-summary
+memo has been banked to fabric. Material = the session made enough tool
+calls that there's likely something worth remembering.
+
+Wire it in by adding to ~/.claude/settings.json:
+
+  "hooks": {
+    "Stop": [
+      { "hooks": [ {
+        "type": "command",
+        "command": "$HOME/bin/kx-session-stop-hook"
+      } ] }
+    ]
+  }
+
+Claude Code feeds a JSON event on stdin:
+
+  {
+    "session_id": "...",
+    "transcript_path": "/path/to/transcript.jsonl",
+    "hook_event_name": "Stop",
+    "stop_hook_active": false
+  }
+
+We:
+1. Read the transcript JSONL.
+2. Count tool calls and check the LAST N turns for a fabric remember call.
+3. If material AND no remember-in-last-N, output JSON to refuse the stop
+   and ask Claude to bank a structured summary first.
+4. Otherwise exit 0 silently — the stop proceeds.
+
+Tuning knobs (env, all optional):
+  KX_STOP_MATERIAL_THRESHOLD  (default 12) — tool calls counted as material
+  KX_STOP_LOOKBACK            (default 50) — turns to scan for remember()
+  KX_STOP_DISABLE             if set to 1, hook is a no-op (escape hatch)
+
+Edge cases:
+- stop_hook_active=true: do NOT refuse again (Claude is recovering from
+  a previous refusal). Bug-out cleanly.
+- Transcript unreadable: exit 0 (do not block).
+- The session's name (from ~/.kx-session) is included in the refusal
+  reason so Claude can include it in the bank.
+"""
+import json
+import os
+import pathlib
+import re
+import sys
+
+
+def load_event() -> dict:
+    try:
+        return json.load(sys.stdin)
+    except Exception:
+        return {}
+
+
+def session_name() -> str:
+    try:
+        # Match the bootstrap's sid-keyed file (preferred) then fallback.
+        sid = os.popen("ps -o sid= -p $PPID 2>/dev/null").read().strip()
+        sid_file = pathlib.Path.home() / ".kx-session" / f"sid-{sid}.name"
+        if sid_file.exists():
+            return sid_file.read_text().strip()
+        legacy = pathlib.Path.home() / ".kx-session" / "current"
+        if legacy.exists():
+            return legacy.read_text().strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def scan_transcript(path: str, lookback: int) -> tuple[int, bool, list[str]]:
+    """
+    Return (tool_call_count, recent_remember_found, recent_tool_names).
+    A "recent" remember = mcp__fabric__remember in the last `lookback`
+    turns (counted from the end of the transcript). Tool call count is
+    over the WHOLE transcript.
+    """
+    tool_calls = 0
+    recent_tools = []
+    rememberers_at = []
+    p = pathlib.Path(path)
+    if not p.exists():
+        return 0, False, []
+    try:
+        with p.open() as f:
+            lines = f.readlines()
+    except Exception:
+        return 0, False, []
+    for idx, raw in enumerate(lines):
+        try:
+            evt = json.loads(raw)
+        except Exception:
+            continue
+        # Anthropic claude-code transcript format: assistant tool-use blocks
+        # appear under message.content[*].type == "tool_use".
+        msg = evt.get("message") or {}
+        content = msg.get("content") or []
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                name = block.get("name", "")
+                tool_calls += 1
+                recent_tools.append((idx, name))
+                if name == "mcp__fabric__remember":
+                    rememberers_at.append(idx)
+    total = len(lines)
+    cutoff = max(0, total - lookback)
+    recent_remember = any(i >= cutoff for i in rememberers_at)
+    recent_names = [n for (i, n) in recent_tools[-15:]]
+    return tool_calls, recent_remember, recent_names
+
+
+def main() -> int:
+    if os.environ.get("KX_STOP_DISABLE") == "1":
+        return 0
+    evt = load_event()
+    if evt.get("stop_hook_active"):
+        # Already in a refused-stop recovery loop; don't refuse twice.
+        return 0
+    transcript = evt.get("transcript_path") or ""
+    threshold = int(os.environ.get("KX_STOP_MATERIAL_THRESHOLD", "12"))
+    lookback = int(os.environ.get("KX_STOP_LOOKBACK", "50"))
+    tool_calls, recent_remember, recent_names = scan_transcript(
+        transcript, lookback
+    )
+    if tool_calls < threshold:
+        return 0  # not material
+    if recent_remember:
+        return 0  # already banked recently
+    sess = session_name()
+    reason = (
+        f"[kx-session-stop-hook B3] This session ({sess}) made "
+        f"{tool_calls} tool calls but no mcp__fabric__remember in the "
+        f"last {lookback} turns. Before ending, bank a STRUCTURED session-"
+        f"summary memo:\n\n"
+        f"  mcp__fabric__remember {{\n"
+        f"    title: 'session summary {sess} <YYYY-MM-DD>',\n"
+        f"    type: 'project',\n"
+        f"    content: '<what changed, what shipped, what's open, "
+        f"surprises, gotchas>'\n"
+        f"  }}\n\n"
+        f"Add upsert_key='session_summary_{sess}_<YYYY-MM-DD>' once the "
+        f"fabric binary supports it (B1 ships supersession).\n\n"
+        f"Recent tool calls (last 15): "
+        f"{', '.join(recent_names) if recent_names else '(none parsed)'}.\n\n"
+        f"Then end the session again — this hook will let it through."
+    )
+    out = {"decision": "block", "reason": reason}
+    sys.stdout.write(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

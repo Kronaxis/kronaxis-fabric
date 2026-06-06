@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# kx-fabric-runtime-snapshot — B5
+#
+# Snapshots the host's runtime state every 4 hours into ONE fabric memo
+# with upsert_key=runtime_<host>. Once B1 binary lands, the memo is
+# overwritten in place (always returns the *current* state, never an
+# archaeology of past states). Pre-binary it banks a fresh row each cycle
+# (~6 rows/host/day — acceptable until binary catches up).
+#
+# What gets snapshotted (all best-effort, never blocks on a single tool):
+#   1. systemd unit env (Environment= drop-ins for kronaxis-relevant units)
+#   2. iptables NAT + filter (root or sudo no-tty if available)
+#   3. nft ruleset summary
+#   4. WireGuard peers + AllowedIPs
+#   5. GPU per-process VRAM (nvidia-smi pmon-1)
+#   6. fabric memo counts per tenant (queried from local PG if creds in env)
+#   7. listening ports filtered to known service ranges
+#   8. ZFS / disk pressure (df / zpool status if present)
+#
+# Env:
+#   FABRIC_URL    default http://127.0.0.1:8201
+#   FABRIC_KEY    default test-key-1 (else ~/.fabric-key)
+#   TENANT_HEADER default kronaxis_claude_session (00000000-...)
+#   PGPASSWORD    optional, enables fabric tenant memo counts
+#   PG_HOST       default 192.168.50.129
+#   PG_USER       default titan
+#   PG_DB         default tfs
+
+set -uo pipefail
+
+FABRIC_URL="${FABRIC_URL:-http://127.0.0.1:8201}"
+FABRIC_KEY="${FABRIC_KEY:-$(cat "$HOME/.fabric-key" 2>/dev/null || echo test-key-1)}"
+TENANT_HEADER="${TENANT_HEADER:-00000000-0000-7000-8000-000000000000}"
+PG_HOST="${PG_HOST:-192.168.50.129}"
+PG_USER="${PG_USER:-titan}"
+PG_DB="${PG_DB:-tfs}"
+
+HOSTNAME_SHORT="$(hostname -s)"
+NOW_UTC="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+KEY="runtime_${HOSTNAME_SHORT}"
+TITLE="RUNTIME ${HOSTNAME_SHORT} ${NOW_UTC}"
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+# ---------- 1. systemd unit env (kronaxis-relevant) ----------
+{
+  echo "## systemd Environment (kronaxis-relevant)"
+  echo '```'
+  for d in /etc/systemd/system "$HOME/.config/systemd/user"; do
+    [ -d "$d" ] || continue
+    grep -rE '^Environment=' "$d" 2>/dev/null \
+      | grep -iE 'fabric|kronaxis|vllm|voice|whisper|piper|glm|router|titan|sip|wg|gst|tts|stt' \
+      | sed 's/^[^:]*\///' \
+      | head -80
+  done
+  echo '```'
+} > "$tmp/env.md"
+
+# ---------- 2. iptables ----------
+{
+  echo "## iptables"
+  echo '```'
+  if sudo -n iptables -t nat -L -n 2>/dev/null; then :; fi
+  echo "---"
+  if sudo -n iptables -L -n 2>/dev/null; then :; fi
+  echo '```'
+} > "$tmp/iptables.md" 2>/dev/null || true
+
+# ---------- 3. nft ----------
+{
+  echo "## nft ruleset"
+  echo '```'
+  sudo -n nft list ruleset 2>/dev/null | head -80 || echo "(nft not available without sudo)"
+  echo '```'
+} > "$tmp/nft.md"
+
+# ---------- 4. WireGuard ----------
+{
+  echo "## WireGuard"
+  echo '```'
+  sudo -n wg show 2>/dev/null | head -120 || echo "(wg show needs sudo)"
+  echo "---"
+  echo "/etc/wireguard configs (peers only, no keys):"
+  for f in /etc/wireguard/*.conf; do
+    [ -f "$f" ] || continue
+    echo "# $f"
+    sudo -n grep -E '^(\[Peer\]|AllowedIPs|Endpoint|PersistentKeepalive)' "$f" 2>/dev/null \
+      || echo "(read failed)"
+  done
+  echo '```'
+} > "$tmp/wg.md"
+
+# ---------- 5. GPU ----------
+{
+  echo "## GPU"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    echo '```'
+    nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader
+    echo "--- per-process VRAM ---"
+    nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
+    echo '```'
+  else
+    echo "(no nvidia-smi)"
+  fi
+} > "$tmp/gpu.md"
+
+# ---------- 6. fabric memo count per tenant ----------
+{
+  echo "## fabric memos per tenant"
+  if [ -n "${PGPASSWORD:-}" ]; then
+    echo '```'
+    PGPASSWORD="$PGPASSWORD" psql -h "$PG_HOST" -U "$PG_USER" -d "$PG_DB" -t -A -c "
+      SELECT 'tenant_00000000', count(*) FROM tenant_00000000.memos WHERE deleted_at IS NULL
+      UNION ALL
+      SELECT 'tenant_019e69cc', count(*) FROM tenant_019e69cc.memos WHERE deleted_at IS NULL
+    " 2>/dev/null || echo "(pg query failed)"
+    echo '```'
+  else
+    echo "(no PG creds in env)"
+  fi
+} > "$tmp/fabric.md"
+
+# ---------- 7. listening ports ----------
+{
+  echo "## listening (filtered)"
+  echo '```'
+  ss -tulnp 2>/dev/null | awk 'NR==1 || $5 ~ /:(80|443|2[0-9]{3}|3[0-9]{3}|4[0-9]{3}|5[0-9]{3}|6[0-9]{3}|7[0-9]{3}|8[0-9]{3}|9[0-9]{3}|10[0-9]{3}|11[0-9]{3})/' | head -50
+  echo '```'
+} > "$tmp/ports.md"
+
+# ---------- 8. disk ----------
+{
+  echo "## disk pressure"
+  echo '```'
+  df -h -x tmpfs -x devtmpfs 2>/dev/null | head -20
+  if command -v zpool >/dev/null 2>&1; then
+    echo "---"
+    sudo -n zpool list -H -o name,size,alloc,free,frag,cap 2>/dev/null \
+      || echo "(zpool present but no sudo)"
+  fi
+  echo '```'
+} > "$tmp/disk.md"
+
+# ---------- assemble ----------
+{
+  echo "# Runtime snapshot — ${HOSTNAME_SHORT} — ${NOW_UTC}"
+  echo ""
+  echo "Generated by kx-fabric-runtime-snapshot (B5). upsert_key=${KEY}."
+  echo "Supersedes prior snapshot for this host once B1 binary lands."
+  echo ""
+  cat "$tmp/env.md"
+  cat "$tmp/iptables.md"
+  cat "$tmp/nft.md"
+  cat "$tmp/wg.md"
+  cat "$tmp/gpu.md"
+  cat "$tmp/fabric.md"
+  cat "$tmp/ports.md"
+  cat "$tmp/disk.md"
+} > "$tmp/snapshot.md"
+
+payload="$(jq -n \
+  --arg title "$TITLE" \
+  --rawfile content "$tmp/snapshot.md" \
+  --arg type "reference" \
+  --arg key "$KEY" \
+  '{title:$title, content:$content, type:$type, upsert_key:$key, tags:["runtime_snapshot","auto","host:'"$HOSTNAME_SHORT"'"]}')"
+
+resp="$(curl -fsS -X POST "${FABRIC_URL}/v1/memo" \
+  -H "Authorization: Bearer ${FABRIC_KEY}" \
+  -H "X-Tenant-ID: ${TENANT_HEADER}" \
+  -H "Content-Type: application/json" \
+  --data "$payload" 2>&1)"
+
+echo "${NOW_UTC} ${HOSTNAME_SHORT} runtime snapshot banked: ${resp}"
