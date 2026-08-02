@@ -215,7 +215,7 @@ func (s *server) handleAdminCrossTenantSearch(tc *tenantCtx, w http.ResponseWrit
 			ID:         t.ID,
 			SchemaName: t.SchemaName,
 		}
-		hits, err := s.searchInSchema(r.Context(), fakeCtx, req.Query, "", "hybrid", req.TopK, req.Rerank)
+		hits, err := s.searchInSchema(r.Context(), fakeCtx, req.Query, "", "hybrid", req.TopK, "", req.Rerank)
 		if err != nil {
 			continue
 		}

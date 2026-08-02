@@ -13,6 +13,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -190,6 +192,13 @@ type memoCreateReq struct {
 	// 2026-06-06" with upsert_key="voice_subsystem_state" overwrites the prior
 	// memo at that key in-place (same id, fresh title/content/type/embedding/ts).
 	UpsertKey string `json:"upsert_key,omitempty"`
+	// AuthorSession names the writing agent session (provenance, 006). Falls back to
+	// the X-Fabric-Session header, then the tenant alias. Used for trust weighting.
+	AuthorSession string `json:"author_session,omitempty"`
+	// ValidFrom/ValidTo (RFC3339) set the world valid-time window (006). Optional;
+	// empty = unbounded. Distinct from created_at (transaction time).
+	ValidFrom string `json:"valid_from,omitempty"`
+	ValidTo   string `json:"valid_to,omitempty"`
 }
 
 type memoUpdateReq struct {
@@ -212,6 +221,9 @@ type searchReq struct {
 	TopK  int    `json:"top_k"`
 	Type  string `json:"type"`
 	Mode  string `json:"mode"` // "hybrid" (default) | "tsvector" | "semantic"
+	// AsOf (RFC3339) restricts results to memos whose world valid-time window
+	// contains the instant — the bitemporal "point in time" query (006).
+	AsOf string `json:"as_of,omitempty"`
 }
 
 type searchHit struct {
@@ -221,6 +233,11 @@ type searchHit struct {
 	Score     float64   `json:"score"`
 	Type      string    `json:"type"`
 	CreatedAt time.Time `json:"created_at"`
+	// TrustTier + Flags surface poisoning risk to the caller (006). Flags carries
+	// e.g. "directive-content" when a memo reads as a command rather than data;
+	// the consuming agent MUST treat a flagged memo as suspect ("data not commands").
+	TrustTier int      `json:"trust_tier"`
+	Flags     []string `json:"flags,omitempty"`
 }
 
 type coordSendReq struct {
@@ -595,6 +612,40 @@ func (s *server) handleCreate(tc *tenantCtx, w http.ResponseWriter, r *http.Requ
 			return
 		}
 	}
+	// Provenance + world valid-time (006). A single post-write UPDATE keyed by id keeps
+	// the tuned INSERT variants untouched. sha256 is unchanged here so this does NOT fire a
+	// version snapshot. Skipped when the write deduped onto an untouched existing row.
+	if inserted || superseded {
+		author := req.AuthorSession
+		if author == "" {
+			author = r.Header.Get("X-Fabric-Session")
+		}
+		if author == "" {
+			author = tc.DisplayAlias
+		}
+		trust := 1 // normal; admin-scoped keys are trusted a notch higher
+		if tc.KeyScope == "admin" {
+			trust = 2
+		}
+		var vfrom, vto *time.Time
+		if req.ValidFrom != "" {
+			if t, e := time.Parse(time.RFC3339, req.ValidFrom); e == nil {
+				vfrom = &t
+			}
+		}
+		if req.ValidTo != "" {
+			if t, e := time.Parse(time.RFC3339, req.ValidTo); e == nil {
+				vto = &t
+			}
+		}
+		if _, e := s.pool.Exec(ctx, fmt.Sprintf(
+			`UPDATE %s.memos SET author_session=$2, write_source=$3, trust_tier=$4,
+			   valid_from=COALESCE($5, valid_from), valid_to=COALESCE($6, valid_to)
+			 WHERE id=$1`, tc.SchemaName),
+			id, author, tc.DisplayAlias, trust, vfrom, vto); e != nil {
+			log.Printf("provenance update warn (tenant=%s id=%d): %v", tc.SchemaName, id, e)
+		}
+	}
 	deduped = !inserted && !superseded
 	writeJSON(w, 200, memoCreateResp{ID: id, SHA256: hash, Deduped: deduped, Embedded: emb != nil, Superseded: superseded})
 }
@@ -706,7 +757,7 @@ func (s *server) handleSearch(tc *tenantCtx, w http.ResponseWriter, r *http.Requ
 	if req.Mode == "" {
 		req.Mode = "hybrid"
 	}
-	hits, err := s.searchInSchema(r.Context(), tc, req.Query, req.Type, req.Mode, req.TopK, false)
+	hits, err := s.searchInSchema(r.Context(), tc, req.Query, req.Type, req.Mode, req.TopK, req.AsOf, false)
 	if err != nil {
 		writeErr(w, 500, "db: "+err.Error())
 		return
@@ -718,12 +769,23 @@ func (s *server) handleSearch(tc *tenantCtx, w http.ResponseWriter, r *http.Requ
 // The schema name comes from `tc.SchemaName` which is already validated.
 // `_ = rerank` is unused on this branch (no mxbai wired); the param keeps the
 // signature stable for handleAdminCrossTenantSearch callers.
-func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeFilter, mode string, topK int, _ bool) ([]searchHit, error) {
+func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeFilter, mode string, topK int, asOf string, _ bool) ([]searchHit, error) {
 	if mode == "" {
 		mode = "hybrid"
 	}
 	sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+
+	// as_of (006): world valid-time point-in-time filter. nil = no restriction.
+	// A nil *time.Time binds as SQL NULL so the "$n IS NULL" guard disables the clause.
+	var asOfArg *time.Time
+	if asOf != "" {
+		if t, e := time.Parse(time.RFC3339, asOf); e == nil {
+			asOfArg = &t
+		} else {
+			return nil, fmt.Errorf("as_of must be RFC3339: %v", e)
+		}
+	}
 
 	var qEmb []float32
 	if mode == "semantic" || mode == "hybrid" {
@@ -743,25 +805,27 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 			SELECT id, title, content,
 			       ts_rank(tsv, plainto_tsquery('english', $1)) * 0.7
 			       + (1.0 / (1 + EXTRACT(EPOCH FROM (now()-created_at))/86400.0/30)) * 0.3 AS score,
-			       type, created_at
+			       type, created_at, trust_tier
 			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND tsv @@ plainto_tsquery('english', $1)
 			  AND ($2 = '' OR type = $2)
-			ORDER BY score DESC LIMIT $3`, tc.SchemaName),
-			query, typeFilter, topK)
+			  AND ($3::timestamptz IS NULL OR ((valid_from IS NULL OR valid_from <= $3) AND (valid_to IS NULL OR valid_to > $3)))
+			ORDER BY score DESC LIMIT $4`, tc.SchemaName),
+			query, typeFilter, asOfArg, topK)
 	case "semantic":
 		rows, err = s.pool.Query(sctx, fmt.Sprintf(`
 			SELECT id, title, content,
 			       (1.0 - (embedding <=> $1)) * 0.8
 			       + (1.0 / (1 + EXTRACT(EPOCH FROM (now()-created_at))/86400.0/30)) * 0.2 AS score,
-			       type, created_at
+			       type, created_at, trust_tier
 			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND embedding IS NOT NULL
 			  AND ($2 = '' OR type = $2)
-			ORDER BY embedding <=> $1 ASC LIMIT $3`, tc.SchemaName),
-			pgvector.NewVector(qEmb), typeFilter, topK)
+			  AND ($3::timestamptz IS NULL OR ((valid_from IS NULL OR valid_from <= $3) AND (valid_to IS NULL OR valid_to > $3)))
+			ORDER BY embedding <=> $1 ASC LIMIT $4`, tc.SchemaName),
+			pgvector.NewVector(qEmb), typeFilter, asOfArg, topK)
 	default: // hybrid
 		rows, err = s.pool.Query(sctx, fmt.Sprintf(`
 			SELECT id, title, content,
@@ -773,16 +837,17 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 			           + COALESCE(ts_rank(tsv, plainto_tsquery('english', $2)), 0) * 0.3
 			           + (1.0 / (1 + EXTRACT(EPOCH FROM (now()-created_at))/86400.0/30)) * 0.2
 			       END AS score,
-			       type, created_at
+			       type, created_at, trust_tier
 			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND ($3 = '' OR type = $3)
+			  AND ($4::timestamptz IS NULL OR ((valid_from IS NULL OR valid_from <= $4) AND (valid_to IS NULL OR valid_to > $4)))
 			  AND (
 			      embedding IS NOT NULL
 			      OR tsv @@ plainto_tsquery('english', $2)
 			  )
-			ORDER BY score DESC LIMIT $4`, tc.SchemaName),
-			pgvector.NewVector(qEmb), query, typeFilter, topK)
+			ORDER BY score DESC LIMIT $5`, tc.SchemaName),
+			pgvector.NewVector(qEmb), query, typeFilter, asOfArg, topK)
 	}
 	if err != nil {
 		return nil, err
@@ -792,13 +857,60 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 	for rows.Next() {
 		var h searchHit
 		var content string
-		if err := rows.Scan(&h.ID, &h.Title, &content, &h.Score, &h.Type, &h.CreatedAt); err != nil {
+		if err := rows.Scan(&h.ID, &h.Title, &content, &h.Score, &h.Type, &h.CreatedAt, &h.TrustTier); err != nil {
 			continue
 		}
 		h.Excerpt = excerpt(content, 200)
+		// Poisoning defence (006, arXiv:2607.06595). A memo that reads as a command
+		// rather than data is surfaced flagged and pushed down the ranking; trust tier
+		// nudges ranking so a low-trust planted memo cannot silently top a query.
+		h.Flags = directiveScreen(h.Title + "\n" + content)
+		if len(h.Flags) > 0 {
+			h.Score -= directivePenalty
+		}
+		h.Score += float64(h.TrustTier-1) * trustWeight
 		hits = append(hits, h)
 	}
+	// re-sort after the trust/directive adjustments (SQL ordered on the raw score)
+	sort.SliceStable(hits, func(i, j int) bool { return hits[i].Score > hits[j].Score })
 	return hits, nil
+}
+
+// directive/poisoning score adjustments (006). Deliberately gentle: a flagged memo
+// is demoted and labelled, not dropped, so a false positive costs ranking not recall.
+const (
+	directivePenalty = 0.5
+	trustWeight      = 0.05
+)
+
+// directivePatterns are HIGH-PRECISION markers of a memo written to steer the reading
+// agent (indirect prompt injection) or to plant a false secret — NOT incidental technical
+// vocabulary. Fabric memos legitimately contain "run"/"curl"/"execute", so those alone are
+// never flagged; only imperative attempts to override behaviour or disclose credentials are.
+var directivePatterns = []struct {
+	re    *regexp.Regexp
+	label string
+}{
+	{regexp.MustCompile(`(?i)\b(ignore|disregard|forget)\b[^.\n]{0,40}\b(previous|prior|above|earlier|all)\b[^.\n]{0,30}\b(instruction|context|message|prompt|rule|guideline)`), "override-instructions"},
+	{regexp.MustCompile(`(?i)\b(override|bypass|disable|turn off)\b[^.\n]{0,30}\b(rule|instruction|policy|guardrail|safety|filter|restriction)`), "override-instructions"},
+	{regexp.MustCompile(`(?i)\bfrom now on\b[^.\n]{0,40}\b(you|always|ignore|only|never|must)`), "behaviour-rewrite"},
+	{regexp.MustCompile(`(?i)\byou (must|should|shall|are (required|instructed)) (now |always |immediately )?(ignore|send|forward|email|delete|reveal|disclose|transfer|exfiltrate|leak|share)`), "imperative-action"},
+	{regexp.MustCompile(`(?i)\b(the )?(real|correct|actual|true|new) (password|api[ _-]?key|secret|token|credential|passphrase)s?\b[^.\n]{0,20}\b(is|are|:|=)`), "planted-secret"},
+	{regexp.MustCompile(`(?i)\bact as\b[^.\n]{0,30}\b(different|new|unrestricted|admin|root|developer|dan)\b`), "role-hijack"},
+	{regexp.MustCompile(`(?im)^\s*(system|assistant)\s*:`), "role-injection"},
+}
+
+// directiveScreen returns the unique set of poisoning labels a memo trips, empty if clean.
+func directiveScreen(text string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, p := range directivePatterns {
+		if p.re.MatchString(text) && !seen[p.label] {
+			seen[p.label] = true
+			out = append(out, p.label)
+		}
+	}
+	return out
 }
 
 // ---------- coord endpoints ----------

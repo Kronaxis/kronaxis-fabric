@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS {{.Schema}}.memos (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   deleted_at TIMESTAMPTZ,
+  -- 004 (2026-06-06): supersession key. ON CONFLICT (upsert_key) DO UPDATE.
+  upsert_key TEXT,
+  -- 006 (2026-08-02): provenance (poisoning defence) + world valid-time.
+  author_session TEXT,
+  write_source TEXT,
+  trust_tier SMALLINT NOT NULL DEFAULT 1,
+  valid_from TIMESTAMPTZ,
+  valid_to TIMESTAMPTZ,
   CONSTRAINT memos_sha256_uniq UNIQUE (sha256)
 );
 
@@ -66,6 +74,49 @@ CREATE INDEX IF NOT EXISTS memos_created_idx
 CREATE INDEX IF NOT EXISTS memos_embedding_ivf
   ON {{.Schema}}.memos USING ivfflat (embedding vector_cosine_ops)
   WITH (lists = 100);
+CREATE UNIQUE INDEX IF NOT EXISTS memos_upsert_key_uniq
+  ON {{.Schema}}.memos (upsert_key)
+  WHERE upsert_key IS NOT NULL AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS memos_valid_time_idx
+  ON {{.Schema}}.memos (valid_from, valid_to) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS memos_trust_idx
+  ON {{.Schema}}.memos (trust_tier) WHERE deleted_at IS NULL;
+
+-- ---------- memo_versions: bitemporal history (005 + 006) ----------
+-- BEFORE UPDATE trigger snapshots the OLD row on content (sha256) change, so
+-- supersession/edits retire-in-place. valid_from/superseded_at = transaction time;
+-- valid_from_w/valid_to_w = world valid time carried from memos.
+CREATE TABLE IF NOT EXISTS {{.Schema}}.memo_versions (
+  version_id BIGSERIAL PRIMARY KEY,
+  memo_id BIGINT NOT NULL,
+  upsert_key TEXT,
+  title TEXT, content TEXT, type TEXT, tags TEXT[], sha256 TEXT,
+  valid_from TIMESTAMPTZ,
+  superseded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  author_session TEXT, write_source TEXT, trust_tier SMALLINT,
+  valid_from_w TIMESTAMPTZ, valid_to_w TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS memo_versions_key_idx
+  ON {{.Schema}}.memo_versions (upsert_key) WHERE upsert_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS memo_versions_memo_idx
+  ON {{.Schema}}.memo_versions (memo_id);
+
+CREATE OR REPLACE FUNCTION {{.Schema}}.snapshot_memo_version() RETURNS trigger AS $t$
+BEGIN
+  IF OLD.sha256 IS DISTINCT FROM NEW.sha256 THEN
+    INSERT INTO {{.Schema}}.memo_versions
+      (memo_id, upsert_key, title, content, type, tags, sha256, valid_from, superseded_at,
+       author_session, write_source, trust_tier, valid_from_w, valid_to_w)
+    VALUES
+      (OLD.id, OLD.upsert_key, OLD.title, OLD.content, OLD.type, OLD.tags, OLD.sha256, OLD.created_at, now(),
+       OLD.author_session, OLD.write_source, OLD.trust_tier, OLD.valid_from, OLD.valid_to);
+  END IF;
+  RETURN NEW;
+END;
+$t$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS memo_version_snapshot ON {{.Schema}}.memos;
+CREATE TRIGGER memo_version_snapshot BEFORE UPDATE ON {{.Schema}}.memos
+  FOR EACH ROW EXECUTE FUNCTION {{.Schema}}.snapshot_memo_version();
 
 CREATE TABLE IF NOT EXISTS {{.Schema}}.prospect_interactions (
   id BIGSERIAL PRIMARY KEY,
