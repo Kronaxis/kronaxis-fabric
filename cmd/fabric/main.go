@@ -645,7 +645,12 @@ func (s *server) handleCreate(tc *tenantCtx, w http.ResponseWriter, r *http.Requ
 			}
 		}
 		// Write-time admission judge (007): withhold a clearly poisoned memo from retrieval.
-		quarantined, qReason = quarantineDecision(directiveScreen(req.Title + "\n" + req.Content))
+		// Gated on trust: the paper's threat is UNTRUSTED writers, so admin-scoped (trust 2)
+		// sessions — the operator's own agents, which legitimately document/quote attacks — are
+		// not quarantined. They are still flagged + demoted at read time by the 006 screen.
+		if trust < 2 {
+			quarantined, qReason = quarantineDecision(directiveScreen(req.Title + "\n" + req.Content))
+		}
 		if _, e := s.pool.Exec(ctx, fmt.Sprintf(
 			`UPDATE %s.memos SET author_session=$2, write_source=$3, trust_tier=$4,
 			   valid_from=COALESCE($5, valid_from), valid_to=COALESCE($6, valid_to),
