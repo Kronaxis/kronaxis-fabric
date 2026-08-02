@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS {{.Schema}}.memos (
   trust_tier SMALLINT NOT NULL DEFAULT 1,
   valid_from TIMESTAMPTZ,
   valid_to TIMESTAMPTZ,
+  -- 007 (2026-08-02): write-time admission quarantine (withheld from retrieval until released).
+  quarantined BOOLEAN NOT NULL DEFAULT false,
+  quarantine_reason TEXT,
   CONSTRAINT memos_sha256_uniq UNIQUE (sha256)
 );
 
@@ -81,6 +84,8 @@ CREATE INDEX IF NOT EXISTS memos_valid_time_idx
   ON {{.Schema}}.memos (valid_from, valid_to) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS memos_trust_idx
   ON {{.Schema}}.memos (trust_tier) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS memos_quarantined_idx
+  ON {{.Schema}}.memos (created_at DESC) WHERE quarantined = true AND deleted_at IS NULL;
 
 -- ---------- memo_versions: bitemporal history (005 + 006) ----------
 -- BEFORE UPDATE trigger snapshots the OLD row on content (sha256) change, so

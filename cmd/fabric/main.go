@@ -214,6 +214,10 @@ type memoCreateResp struct {
 	Deduped    bool   `json:"deduped"`
 	Embedded   bool   `json:"embedded"`
 	Superseded bool   `json:"superseded,omitempty"` // true when upsert_key path updated a prior row
+	// Quarantined (007): true when the write tripped the admission judge and the memo was
+	// stored but withheld from retrieval pending human release. Reason lists the flags.
+	Quarantined     bool   `json:"quarantined,omitempty"`
+	QuarantineReason string `json:"quarantine_reason,omitempty"`
 }
 
 type searchReq struct {
@@ -615,6 +619,8 @@ func (s *server) handleCreate(tc *tenantCtx, w http.ResponseWriter, r *http.Requ
 	// Provenance + world valid-time (006). A single post-write UPDATE keyed by id keeps
 	// the tuned INSERT variants untouched. sha256 is unchanged here so this does NOT fire a
 	// version snapshot. Skipped when the write deduped onto an untouched existing row.
+	var quarantined bool
+	var qReason string
 	if inserted || superseded {
 		author := req.AuthorSession
 		if author == "" {
@@ -638,16 +644,23 @@ func (s *server) handleCreate(tc *tenantCtx, w http.ResponseWriter, r *http.Requ
 				vto = &t
 			}
 		}
+		// Write-time admission judge (007): withhold a clearly poisoned memo from retrieval.
+		quarantined, qReason = quarantineDecision(directiveScreen(req.Title + "\n" + req.Content))
 		if _, e := s.pool.Exec(ctx, fmt.Sprintf(
 			`UPDATE %s.memos SET author_session=$2, write_source=$3, trust_tier=$4,
-			   valid_from=COALESCE($5, valid_from), valid_to=COALESCE($6, valid_to)
+			   valid_from=COALESCE($5, valid_from), valid_to=COALESCE($6, valid_to),
+			   quarantined=$7, quarantine_reason=NULLIF($8,'')
 			 WHERE id=$1`, tc.SchemaName),
-			id, author, tc.DisplayAlias, trust, vfrom, vto); e != nil {
+			id, author, tc.DisplayAlias, trust, vfrom, vto, quarantined, qReason); e != nil {
 			log.Printf("provenance update warn (tenant=%s id=%d): %v", tc.SchemaName, id, e)
+		}
+		if quarantined {
+			log.Printf("QUARANTINED memo (tenant=%s id=%d author=%s reason=%s)", tc.SchemaName, id, author, qReason)
 		}
 	}
 	deduped = !inserted && !superseded
-	writeJSON(w, 200, memoCreateResp{ID: id, SHA256: hash, Deduped: deduped, Embedded: emb != nil, Superseded: superseded})
+	writeJSON(w, 200, memoCreateResp{ID: id, SHA256: hash, Deduped: deduped, Embedded: emb != nil,
+		Superseded: superseded, Quarantined: quarantined, QuarantineReason: qReason})
 }
 
 func (s *server) handleUpdate(tc *tenantCtx, w http.ResponseWriter, r *http.Request, id int64) {
@@ -808,6 +821,7 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 			       type, created_at, trust_tier
 			FROM %s.memos
 			WHERE deleted_at IS NULL
+			  AND quarantined = false
 			  AND tsv @@ plainto_tsquery('english', $1)
 			  AND ($2 = '' OR type = $2)
 			  AND ($3::timestamptz IS NULL OR ((valid_from IS NULL OR valid_from <= $3) AND (valid_to IS NULL OR valid_to > $3)))
@@ -821,6 +835,7 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 			       type, created_at, trust_tier
 			FROM %s.memos
 			WHERE deleted_at IS NULL
+			  AND quarantined = false
 			  AND embedding IS NOT NULL
 			  AND ($2 = '' OR type = $2)
 			  AND ($3::timestamptz IS NULL OR ((valid_from IS NULL OR valid_from <= $3) AND (valid_to IS NULL OR valid_to > $3)))
@@ -840,6 +855,7 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 			       type, created_at, trust_tier
 			FROM %s.memos
 			WHERE deleted_at IS NULL
+			  AND quarantined = false
 			  AND ($3 = '' OR type = $3)
 			  AND ($4::timestamptz IS NULL OR ((valid_from IS NULL OR valid_from <= $4) AND (valid_to IS NULL OR valid_to > $4)))
 			  AND (
@@ -911,6 +927,90 @@ func directiveScreen(text string) []string {
 		}
 	}
 	return out
+}
+
+// severeFlags are the high-confidence poisoning signals that justify withholding a memo
+// from retrieval at WRITE time (007), not merely demoting it at read time.
+var severeFlags = map[string]bool{
+	"planted-secret":        true,
+	"override-instructions": true,
+	"role-injection":        true,
+	"role-hijack":           true,
+}
+
+// quarantineDecision is STRICTER than the read-time demote: quarantine only on a severe
+// signal or on two-plus distinct signals, so a single weak signal (e.g. one imperative
+// phrase in an otherwise legitimate memo) stays findable, just demoted. Returns whether to
+// quarantine and a comma-joined reason.
+func quarantineDecision(flags []string) (bool, string) {
+	if len(flags) == 0 {
+		return false, ""
+	}
+	severe := false
+	for _, f := range flags {
+		if severeFlags[f] {
+			severe = true
+			break
+		}
+	}
+	if severe || len(flags) >= 2 {
+		return true, strings.Join(flags, ",")
+	}
+	return false, ""
+}
+
+// handleListQuarantined returns the tenant's quarantine review queue (007).
+func (s *server) handleListQuarantined(tc *tenantCtx, w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(
+		`SELECT id, title, content, type, created_at, coalesce(quarantine_reason,''), coalesce(author_session,'')
+		 FROM %s.memos WHERE quarantined = true AND deleted_at IS NULL
+		 ORDER BY created_at DESC LIMIT 100`, tc.SchemaName))
+	if err != nil {
+		writeErr(w, 500, "db: "+err.Error())
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var id int64
+		var title, content, mtype, reason, author string
+		var created time.Time
+		if err := rows.Scan(&id, &title, &content, &mtype, &created, &reason, &author); err != nil {
+			continue
+		}
+		out = append(out, map[string]any{"id": id, "title": title, "excerpt": excerpt(content, 300),
+			"type": mtype, "created_at": created, "quarantine_reason": reason, "author_session": author})
+	}
+	writeJSON(w, 200, map[string]any{"quarantined": out, "count": len(out), "tenant": tc.DisplayAlias})
+}
+
+// handleRelease clears quarantine on a memo after human review (007). POST {"id": N}.
+// sha256 is unchanged so this does not fire a version snapshot.
+func (s *server) handleRelease(tc *tenantCtx, w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ID == 0 {
+		writeErr(w, 400, "id required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	tag, err := s.pool.Exec(ctx, fmt.Sprintf(
+		`UPDATE %s.memos SET quarantined=false, quarantine_reason=NULL
+		 WHERE id=$1 AND quarantined=true AND deleted_at IS NULL`, tc.SchemaName), req.ID)
+	if err != nil {
+		writeErr(w, 500, "db: "+err.Error())
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		writeErr(w, 404, "not found or not quarantined")
+		return
+	}
+	log.Printf("RELEASED quarantined memo (tenant=%s id=%d)", tc.SchemaName, req.ID)
+	writeJSON(w, 200, map[string]any{"id": req.ID, "released": true})
 }
 
 // ---------- coord endpoints ----------
@@ -2021,6 +2121,15 @@ func (s *server) routes() http.Handler {
 	// ---------- tenant-scoped memo routes ----------
 	mux.HandleFunc("/v1/memo/search", s.withTenant(s.handleSearch))
 	mux.HandleFunc("/v1/memo/backfill", s.withTenant(s.handleBackfillEmbeddings))
+	// 007: quarantine review queue (list) + release after human review
+	mux.HandleFunc("/v1/memo/quarantined", s.withTenant(s.handleListQuarantined))
+	mux.HandleFunc("/v1/memo/release", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeErr(w, 405, "POST only")
+			return
+		}
+		s.withTenant(s.handleRelease)(w, r)
+	})
 	mux.HandleFunc("/v1/memo/", func(w http.ResponseWriter, r *http.Request) {
 		// /v1/memo/:id with GET/PUT/DELETE — resolved via withTenantID.
 		switch r.Method {
