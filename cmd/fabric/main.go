@@ -140,6 +140,12 @@ type server struct {
 	ollamaURL      string
 	httpClient     *http.Client
 	tenantResolver *tenantResolver
+	// contradiction judge (008): "" disables. Own client with a long timeout since the
+	// background judge tolerates a slow local model; judgeSem caps concurrent judge calls.
+	judgeURL    string
+	judgeModel  string
+	judgeClient *http.Client
+	judgeSem    chan struct{}
 }
 
 // withTenant wraps a tenant-scoped handler with auth + tenant resolution. The
@@ -662,6 +668,11 @@ func (s *server) handleCreate(tc *tenantCtx, w http.ResponseWriter, r *http.Requ
 		if quarantined {
 			log.Printf("QUARANTINED memo (tenant=%s id=%d author=%s reason=%s)", tc.SchemaName, id, author, qReason)
 		}
+		// Layer 3 (008): off-hot-path contradiction check vs trusted neighbours. Only for a genuinely
+		// new memo (not a supersession-update or dedup) that was not already quarantined by the screen.
+		if inserted && emb != nil && !quarantined {
+			go s.checkContradiction(tc.SchemaName, id, trust)
+		}
 	}
 	deduped = !inserted && !superseded
 	writeJSON(w, 200, memoCreateResp{ID: id, SHA256: hash, Deduped: deduped, Embedded: emb != nil,
@@ -823,7 +834,7 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 			SELECT id, title, content,
 			       ts_rank(tsv, plainto_tsquery('english', $1)) * 0.7
 			       + (1.0 / (1 + EXTRACT(EPOCH FROM (now()-created_at))/86400.0/30)) * 0.3 AS score,
-			       type, created_at, trust_tier
+			       type, created_at, trust_tier, contested
 			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND quarantined = false
@@ -837,7 +848,7 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 			SELECT id, title, content,
 			       (1.0 - (embedding <=> $1)) * 0.8
 			       + (1.0 / (1 + EXTRACT(EPOCH FROM (now()-created_at))/86400.0/30)) * 0.2 AS score,
-			       type, created_at, trust_tier
+			       type, created_at, trust_tier, contested
 			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND quarantined = false
@@ -857,7 +868,7 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 			           + COALESCE(ts_rank(tsv, plainto_tsquery('english', $2)), 0) * 0.3
 			           + (1.0 / (1 + EXTRACT(EPOCH FROM (now()-created_at))/86400.0/30)) * 0.2
 			       END AS score,
-			       type, created_at, trust_tier
+			       type, created_at, trust_tier, contested
 			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND quarantined = false
@@ -878,7 +889,8 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 	for rows.Next() {
 		var h searchHit
 		var content string
-		if err := rows.Scan(&h.ID, &h.Title, &content, &h.Score, &h.Type, &h.CreatedAt, &h.TrustTier); err != nil {
+		var contested bool
+		if err := rows.Scan(&h.ID, &h.Title, &content, &h.Score, &h.Type, &h.CreatedAt, &h.TrustTier, &contested); err != nil {
 			continue
 		}
 		h.Excerpt = excerpt(content, 200)
@@ -886,6 +898,11 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 		// rather than data is surfaced flagged and pushed down the ranking; trust tier
 		// nudges ranking so a low-trust planted memo cannot silently top a query.
 		h.Flags = directiveScreen(h.Title + "\n" + content)
+		// Layer 3 (008): a trusted memo the judge found to contradict established memos is
+		// surfaced as contested so the reader weighs it against the record (not hidden).
+		if contested {
+			h.Flags = append(h.Flags, "contested-fact")
+		}
 		if len(h.Flags) > 0 {
 			h.Score -= directivePenalty
 		}
@@ -1016,6 +1033,139 @@ func (s *server) handleRelease(tc *tenantCtx, w http.ResponseWriter, r *http.Req
 	}
 	log.Printf("RELEASED quarantined memo (tenant=%s id=%d)", tc.SchemaName, req.ID)
 	writeJSON(w, 200, map[string]any{"id": req.ID, "released": true})
+}
+
+// contradiction defence tuning (008).
+const (
+	contradictionNeighbours  = 5    // top trusted neighbours shown to the judge
+	contradictionMaxDistance = 0.35 // cosine distance ceiling (>= ~0.65 similarity) to count as same topic
+)
+
+// checkContradiction runs OFF the hot path (goroutine) after a new memo is written. It retrieves the
+// memo's nearest TRUSTED neighbours and asks the judge whether the new memo contradicts them (the
+// RAGuard/ZKIP idea without the per-query generation tax). An untrusted contradiction is quarantined
+// (007); a trusted one is marked contested and surfaced as a flag, never hidden (belief revision is
+// legitimate). Fails silent: any error or a judge that is down simply skips the check.
+func (s *server) checkContradiction(schema string, id int64, trust int) {
+	if s.judgeURL == "" {
+		return
+	}
+	s.judgeSem <- struct{}{}
+	defer func() { <-s.judgeSem }()
+	ctx, cancel := context.WithTimeout(context.Background(), 110*time.Second)
+	defer cancel()
+
+	var content string
+	if err := s.pool.QueryRow(ctx, fmt.Sprintf(
+		`SELECT content FROM %s.memos WHERE id=$1 AND embedding IS NOT NULL AND deleted_at IS NULL`, schema),
+		id).Scan(&content); err != nil {
+		return // deduped away, deleted, or no embedding to compare
+	}
+	// Nearest trusted neighbours on the same topic. The new memo's embedding stays in SQL via a
+	// subquery, so no vector round-trips through Go.
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
+		SELECT content FROM %s.memos
+		WHERE id <> $1 AND deleted_at IS NULL AND quarantined = false
+		  AND embedding IS NOT NULL AND trust_tier >= 2
+		  AND (embedding <=> (SELECT embedding FROM %s.memos WHERE id=$1)) <= $2
+		ORDER BY embedding <=> (SELECT embedding FROM %s.memos WHERE id=$1) ASC
+		LIMIT $3`, schema, schema, schema),
+		id, contradictionMaxDistance, contradictionNeighbours)
+	if err != nil {
+		log.Printf("contradiction neighbours warn (tenant=%s id=%d): %v", schema, id, err)
+		return
+	}
+	var neighbours []string
+	for rows.Next() {
+		var c string
+		if rows.Scan(&c) == nil {
+			neighbours = append(neighbours, c)
+		}
+	}
+	rows.Close()
+	if len(neighbours) == 0 {
+		return // novel topic; nothing established to contradict
+	}
+
+	contradicts, reason := s.judgeContradiction(ctx, content, neighbours)
+	if !contradicts {
+		return
+	}
+	if trust < 2 {
+		if _, err := s.pool.Exec(ctx, fmt.Sprintf(
+			`UPDATE %s.memos SET quarantined=true, quarantine_reason=$2 WHERE id=$1 AND quarantined=false`, schema),
+			id, "contradiction: "+reason); err == nil {
+			log.Printf("QUARANTINED (contradiction, untrusted) tenant=%s id=%d: %s", schema, id, reason)
+		}
+	} else {
+		if _, err := s.pool.Exec(ctx, fmt.Sprintf(
+			`UPDATE %s.memos SET contested=true, contested_reason=$2 WHERE id=$1 AND contested=false`, schema),
+			id, reason); err == nil {
+			log.Printf("CONTESTED (contradiction, trusted) tenant=%s id=%d: %s", schema, id, reason)
+		}
+	}
+}
+
+type judgeVerdict struct {
+	Contradicts bool   `json:"contradicts"`
+	Reason      string `json:"reason"`
+}
+
+// judgeContradiction asks the configured OpenAI-compatible judge whether `memo` contradicts any of
+// the established `neighbours`. Returns (false, "") on any transport or parse failure.
+func (s *server) judgeContradiction(ctx context.Context, memo string, neighbours []string) (bool, string) {
+	var est strings.Builder
+	for i, n := range neighbours {
+		fmt.Fprintf(&est, "[%d] %s\n", i+1, excerpt(n, 700))
+	}
+	prompt := fmt.Sprintf(`You are a fact-consistency checker for a shared knowledge base. Below are ESTABLISHED memos, then a NEW memo. Decide ONLY whether the NEW memo asserts a factual claim that DIRECTLY CONTRADICTS an established memo, meaning it states the opposite of, or is mutually exclusive with, an established fact. Adding new information, elaborating, or covering a different point is NOT a contradiction. When in doubt, answer false. Reply with ONLY a JSON object and nothing else: {"contradicts": true or false, "reason": "at most 15 words naming the conflict, or empty"}.
+
+ESTABLISHED:
+%s
+NEW:
+%s`, est.String(), excerpt(memo, 700))
+
+	reqBody, _ := json.Marshal(map[string]any{
+		"model":       s.judgeModel,
+		"messages":    []map[string]string{{"role": "user", "content": prompt}},
+		"temperature": 0,
+		"max_tokens":  120,
+	})
+	req, err := http.NewRequestWithContext(ctx, "POST", s.judgeURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return false, ""
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.judgeClient.Do(req)
+	if err != nil {
+		log.Printf("contradiction judge warn: %v", err)
+		return false, ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return false, ""
+	}
+	var oa struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&oa) != nil || len(oa.Choices) == 0 {
+		return false, ""
+	}
+	txt := oa.Choices[0].Message.Content
+	i := strings.Index(txt, "{")
+	j := strings.LastIndex(txt, "}")
+	if i < 0 || j <= i {
+		return false, ""
+	}
+	var v judgeVerdict
+	if json.Unmarshal([]byte(txt[i:j+1]), &v) != nil {
+		return false, ""
+	}
+	return v.Contradicts, strings.TrimSpace(v.Reason)
 }
 
 // ---------- coord endpoints ----------
@@ -2358,6 +2508,21 @@ func main() {
 
 	requireHeader := strings.EqualFold(os.Getenv("FABRIC_REQUIRE_TENANT_HEADER"), "true")
 
+	// Contradiction judge config (008). Defaults to the local ollama OpenAI endpoint (already a
+	// dependency for embeddings); override with FABRIC_JUDGE_URL / FABRIC_JUDGE_MODEL, or disable
+	// with FABRIC_JUDGE_DISABLE=true.
+	judgeURL := os.Getenv("FABRIC_JUDGE_URL")
+	if judgeURL == "" {
+		judgeURL = strings.TrimRight(ollamaURL, "/") + "/v1/chat/completions"
+	}
+	if strings.EqualFold(os.Getenv("FABRIC_JUDGE_DISABLE"), "true") {
+		judgeURL = ""
+	}
+	judgeModel := os.Getenv("FABRIC_JUDGE_MODEL")
+	if judgeModel == "" {
+		judgeModel = "qwen2.5:7b-instruct"
+	}
+
 	s := &server{
 		pool:      pool,
 		apiKey:    apiKey,
@@ -2365,6 +2530,10 @@ func main() {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		judgeURL:    judgeURL,
+		judgeModel:  judgeModel,
+		judgeClient: &http.Client{Timeout: 120 * time.Second},
+		judgeSem:    make(chan struct{}, 4),
 	}
 	s.tenantResolver = &tenantResolver{
 		pool:             pool,

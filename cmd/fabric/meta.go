@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS {{.Schema}}.memos (
   -- 007 (2026-08-02): write-time admission quarantine (withheld from retrieval until released).
   quarantined BOOLEAN NOT NULL DEFAULT false,
   quarantine_reason TEXT,
+  -- 008 (2026-08-04): trusted memo the contradiction judge flagged against established memos.
+  contested BOOLEAN NOT NULL DEFAULT false,
+  contested_reason TEXT,
   CONSTRAINT memos_sha256_uniq UNIQUE (sha256)
 );
 
