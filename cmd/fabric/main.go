@@ -204,7 +204,13 @@ type memoCreateReq struct {
 	// ValidFrom/ValidTo (RFC3339) set the world valid-time window (006). Optional;
 	// empty = unbounded. Distinct from created_at (transaction time).
 	ValidFrom string `json:"valid_from,omitempty"`
-	ValidTo   string `json:"valid_to,omitempty"`
+	// Supersedes (009) lists memo ids this memo replaces. Each of them gets
+	// superseded_by = this id and drops out of search unless include_history is
+	// set. The body is also scanned for "CORRECTION to #N", "CORRECTS #N",
+	// "SUPERSEDES #N", "REPLACES #N" and "RETIRES #N"; "Delta on #N" is NOT a
+	// supersession (it means continuation as often as replacement).
+	Supersedes []int64 `json:"supersedes,omitempty"`
+	ValidTo    string  `json:"valid_to,omitempty"`
 }
 
 type memoUpdateReq struct {
@@ -222,7 +228,7 @@ type memoCreateResp struct {
 	Superseded bool   `json:"superseded,omitempty"` // true when upsert_key path updated a prior row
 	// Quarantined (007): true when the write tripped the admission judge and the memo was
 	// stored but withheld from retrieval pending human release. Reason lists the flags.
-	Quarantined     bool   `json:"quarantined,omitempty"`
+	Quarantined      bool   `json:"quarantined,omitempty"`
 	QuarantineReason string `json:"quarantine_reason,omitempty"`
 }
 
@@ -234,6 +240,9 @@ type searchReq struct {
 	// AsOf (RFC3339) restricts results to memos whose world valid-time window
 	// contains the instant — the bitemporal "point in time" query (006).
 	AsOf string `json:"as_of,omitempty"`
+	// IncludeHistory (009) returns memos that a later memo has superseded.
+	// Default false: a superseded memo is the wrong answer to a neutral question.
+	IncludeHistory bool `json:"include_history,omitempty"`
 }
 
 type searchHit struct {
@@ -668,6 +677,15 @@ func (s *server) handleCreate(tc *tenantCtx, w http.ResponseWriter, r *http.Requ
 		if quarantined {
 			log.Printf("QUARANTINED memo (tenant=%s id=%d author=%s reason=%s)", tc.SchemaName, id, author, qReason)
 		}
+		// Supersession (009): explicit ids plus the correction phrases in the body. A
+		// quarantined memo supersedes nothing; an older memo cannot supersede a newer one.
+		if !quarantined {
+			targets := append([]int64{}, req.Supersedes...)
+			targets = append(targets, supersessionRefs(req.Title+"\n"+req.Content)...)
+			if n := s.applySupersession(ctx, tc.SchemaName, id, targets); n > 0 {
+				log.Printf("supersession (tenant=%s id=%d): %d memo(s) marked superseded", tc.SchemaName, id, n)
+			}
+		}
 		// Layer 3 (008): off-hot-path contradiction check vs trusted neighbours. Only for a genuinely
 		// new memo (not a supersession-update or dedup) that was not already quarantined by the screen.
 		if inserted && emb != nil && !quarantined {
@@ -786,7 +804,7 @@ func (s *server) handleSearch(tc *tenantCtx, w http.ResponseWriter, r *http.Requ
 	if req.Mode == "" {
 		req.Mode = "hybrid"
 	}
-	hits, err := s.searchInSchema(r.Context(), tc, req.Query, req.Type, req.Mode, req.TopK, req.AsOf, false)
+	hits, err := s.searchInSchema(r.Context(), tc, req.Query, req.Type, req.Mode, req.TopK, req.AsOf, false, req.IncludeHistory)
 	if err != nil {
 		writeErr(w, 500, "db: "+err.Error())
 		return
@@ -798,9 +816,14 @@ func (s *server) handleSearch(tc *tenantCtx, w http.ResponseWriter, r *http.Requ
 // The schema name comes from `tc.SchemaName` which is already validated.
 // `_ = rerank` is unused on this branch (no mxbai wired); the param keeps the
 // signature stable for handleAdminCrossTenantSearch callers.
-func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeFilter, mode string, topK int, asOf string, _ bool) ([]searchHit, error) {
+func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeFilter, mode string, topK int, asOf string, _ bool, includeHistory ...bool) ([]searchHit, error) {
 	if mode == "" {
 		mode = "hybrid"
+	}
+	// Supersession mask (009): a memo a later memo replaced is not an answer.
+	histClause := "AND superseded_by IS NULL"
+	if len(includeHistory) > 0 && includeHistory[0] {
+		histClause = ""
 	}
 	sctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -838,10 +861,11 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND quarantined = false
+			  %s
 			  AND tsv @@ plainto_tsquery('english', $1)
 			  AND ($2 = '' OR type = $2)
 			  AND ($3::timestamptz IS NULL OR ((valid_from IS NULL OR valid_from <= $3) AND (valid_to IS NULL OR valid_to > $3)))
-			ORDER BY score DESC LIMIT $4`, tc.SchemaName),
+			ORDER BY score DESC LIMIT $4`, tc.SchemaName, histClause),
 			query, typeFilter, asOfArg, topK)
 	case "semantic":
 		rows, err = s.pool.Query(sctx, fmt.Sprintf(`
@@ -852,10 +876,11 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND quarantined = false
+			  %s
 			  AND embedding IS NOT NULL
 			  AND ($2 = '' OR type = $2)
 			  AND ($3::timestamptz IS NULL OR ((valid_from IS NULL OR valid_from <= $3) AND (valid_to IS NULL OR valid_to > $3)))
-			ORDER BY embedding <=> $1 ASC LIMIT $4`, tc.SchemaName),
+			ORDER BY embedding <=> $1 ASC LIMIT $4`, tc.SchemaName, histClause),
 			pgvector.NewVector(qEmb), typeFilter, asOfArg, topK)
 	default: // hybrid
 		rows, err = s.pool.Query(sctx, fmt.Sprintf(`
@@ -872,13 +897,14 @@ func (s *server) searchInSchema(ctx context.Context, tc *tenantCtx, query, typeF
 			FROM %s.memos
 			WHERE deleted_at IS NULL
 			  AND quarantined = false
+			  %s
 			  AND ($3 = '' OR type = $3)
 			  AND ($4::timestamptz IS NULL OR ((valid_from IS NULL OR valid_from <= $4) AND (valid_to IS NULL OR valid_to > $4)))
 			  AND (
 			      embedding IS NOT NULL
 			      OR tsv @@ plainto_tsquery('english', $2)
 			  )
-			ORDER BY score DESC LIMIT $5`, tc.SchemaName),
+			ORDER BY score DESC LIMIT $5`, tc.SchemaName, histClause),
 			pgvector.NewVector(qEmb), query, typeFilter, asOfArg, topK)
 	}
 	if err != nil {
@@ -2554,4 +2580,46 @@ func main() {
 	if err := http.ListenAndServe(listen, s.routes()); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// supersessionRefs (009) finds the memo ids a body says it corrects or replaces.
+// "Delta on #N" is deliberately excluded: it means continuation as often as replacement.
+var reSupersedes = regexp.MustCompile(`(?i)\b(?:CORRECTION\s+(?:to|of)|CORRECTS|SUPERSEDES|REPLACES|RETIRES|OVERRIDES)\s+(?:memo\s+)?#(\d{2,7})\b`)
+
+func supersessionRefs(text string) []int64 {
+	var ids []int64
+	for _, m := range reSupersedes.FindAllStringSubmatch(text, -1) {
+		if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+			ids = append(ids, v)
+		}
+	}
+	return ids
+}
+
+// applySupersession marks the target memos as replaced by newID. Only older, live,
+// unquarantined memos are touched; a memo never supersedes itself.
+func (s *server) applySupersession(ctx context.Context, schema string, newID int64, targets []int64) int {
+	if len(targets) == 0 {
+		return 0
+	}
+	seen := map[int64]bool{}
+	var ids []int64
+	for _, t := range targets {
+		if t > 0 && t != newID && !seen[t] {
+			seen[t] = true
+			ids = append(ids, t)
+		}
+	}
+	if len(ids) == 0 {
+		return 0
+	}
+	tag, err := s.pool.Exec(ctx, fmt.Sprintf(
+		`UPDATE %s.memos SET superseded_by=$1, superseded_at=now()
+		 WHERE id = ANY($2) AND id < $1 AND deleted_at IS NULL AND superseded_by IS NULL`, schema),
+		newID, ids)
+	if err != nil {
+		log.Printf("supersession warn (schema=%s id=%d): %v", schema, newID, err)
+		return 0
+	}
+	return int(tag.RowsAffected())
 }
