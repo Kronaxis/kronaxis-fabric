@@ -178,12 +178,13 @@ func (s *server) handleTenantPurge(tc *tenantCtx, w http.ResponseWriter, r *http
 		writeErr(w, 400, "invalid json: "+err.Error())
 		return
 	}
-	if err := purgeTenant(r.Context(), s.pool, id, req.Confirm); err != nil {
+	counts, err := purgeTenant(r.Context(), s.pool, id, req.Confirm, &tc.ID, &tc.KeyID)
+	if err != nil {
 		writeErr(w, 400, "purge: "+err.Error())
 		return
 	}
 	s.tenantResolver.invalidateAll()
-	writeJSON(w, 200, map[string]any{"id": id, "purged": true})
+	writeJSON(w, 200, map[string]any{"id": id, "purged": true, "rows_removed": counts})
 }
 
 // handleAdminCrossTenantSearch — fan-out across selected tenants. Admin-only.

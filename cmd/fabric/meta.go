@@ -544,33 +544,89 @@ func softDeleteTenant(ctx context.Context, pool *pgxpool.Pool, tenantID string) 
 	return nil
 }
 
-// purgeTenant drops the schema CASCADE and deletes the tenants row. Hard,
-// irreversible. confirm MUST match tenantID.
-func purgeTenant(ctx context.Context, pool *pgxpool.Pool, tenantID, confirm string) error {
+// purgeTenant erases a tenant: it drops the tenant schema (memos, memo
+// versions and their embeddings, prospect interactions) CASCADE, deletes the
+// tenant's keys and the tenants row, and scrubs the detail of every earlier
+// audit row that concerns the tenant. It keeps one audit record of the
+// erasure itself: who did it, when, which tenant id, and the row counts
+// removed, with no content. Hard, irreversible; confirm MUST match tenantID.
+// audit_log's actor FKs are ON DELETE SET NULL (migration 010), so the
+// tenant's own earlier audit rows no longer block the delete.
+func purgeTenant(ctx context.Context, pool *pgxpool.Pool, tenantID, confirm string, actorTenant *string, actorKey *int64) (map[string]int64, error) {
 	if tenantID != confirm {
-		return errors.New("confirm token does not match tenant_id")
+		return nil, errors.New("confirm token does not match tenant_id")
 	}
 	t, err := getTenant(ctx, pool, tenantID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	// Cascade: tenant_keys, audit refs (set to NULL on delete via FK), schema.
+	var children int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM kronaxis_meta.tenants WHERE parent_tenant_id=$1::uuid`, tenantID).Scan(&children); err != nil {
+		return nil, fmt.Errorf("child check: %w", err)
+	}
+	if children > 0 {
+		return nil, fmt.Errorf("tenant has %d child tenants; purge them first", children)
+	}
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP SCHEMA IF EXISTS %s CASCADE`, t.SchemaName)); err != nil {
-		return fmt.Errorf("drop schema: %w", err)
+
+	counts := map[string]int64{}
+	rows, err := tx.Query(ctx, `SELECT table_name FROM information_schema.tables WHERE table_schema=$1 AND table_type='BASE TABLE' ORDER BY 1`, t.SchemaName)
+	if err != nil {
+		return nil, fmt.Errorf("list tables: %w", err)
 	}
+	var tables []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		tables = append(tables, n)
+	}
+	rows.Close()
+	for _, tbl := range tables {
+		var n int64
+		q := fmt.Sprintf(`SELECT count(*) FROM %s.%s`, pgx.Identifier{t.SchemaName}.Sanitize(), pgx.Identifier{tbl}.Sanitize())
+		if err := tx.QueryRow(ctx, q).Scan(&n); err != nil {
+			return nil, fmt.Errorf("count %s: %w", tbl, err)
+		}
+		counts[tbl] = n
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP SCHEMA IF EXISTS %s CASCADE`, pgx.Identifier{t.SchemaName}.Sanitize())); err != nil {
+		return nil, fmt.Errorf("drop schema: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM kronaxis_meta.tenant_keys WHERE tenant_id=$1::uuid`, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("delete keys: %w", err)
+	}
+	counts["tenant_keys"] = tag.RowsAffected()
+	tag, err = tx.Exec(ctx, `
+		UPDATE kronaxis_meta.audit_log
+		SET detail = jsonb_build_object('scrubbed_on_purge', true)
+		WHERE target_tenant_id = $1::uuid OR actor_tenant_id = $1::uuid OR detail::text LIKE '%' || $1 || '%'`,
+		tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("scrub audit: %w", err)
+	}
+	counts["audit_rows_scrubbed"] = tag.RowsAffected()
 	if _, err := tx.Exec(ctx, `DELETE FROM kronaxis_meta.tenants WHERE id=$1::uuid`, tenantID); err != nil {
-		return fmt.Errorf("delete tenants: %w", err)
+		return nil, fmt.Errorf("delete tenants: %w", err)
+	}
+	// The erasure record is written inside the same transaction, so there is
+	// never an erasure without its record or a record without the erasure.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO kronaxis_meta.audit_log (actor_tenant_id, actor_key_id, action, target_tenant_id, detail)
+		VALUES ($1, $2, 'tenant.purge', $3::uuid, $4::jsonb)`,
+		actorTenant, actorKey, tenantID, mustJSON(map[string]any{"rows_removed": counts}),
+	); err != nil {
+		return nil, fmt.Errorf("audit: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return err
+		return nil, err
 	}
-	auditWrite(context.Background(), pool, nil, nil, "tenant.purge", &tenantID, map[string]any{
-		"schema": t.SchemaName,
-	})
-	return nil
+	return counts, nil
 }
